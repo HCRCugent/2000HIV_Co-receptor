@@ -1,0 +1,2463 @@
+---
+title: "2000HIV_Tropism_reservoir comparision"
+author: "Kavita Mehta"
+date: "2026-01-20"
+output: html_document
+---
+
+#setup chunk
+```{r}
+
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(readxl)
+  library(writexl)
+  library(ggsignif)
+  library(dplyr)
+  library(scales)
+  library(purrr)
+  library(readr)
+  library(tidyr)
+  library(rstatix)
+})
+
+# -----------------------------
+# WORKDIR + INPUT
+# -----------------------------
+setwd("R:/hcrc/Personal folders/Kavita Mehta/Manuscripts/2000HIV_Tropism/reservoir/nonpara")
+
+file_path <- "R:/hcrc/Personal folders/Kavita Mehta/2000HIV/clinical data/KAVITA_IMPUT_DATAFRAME_SMOKING_CURRENT_RESOLVED.xlsx"
+```
+
+
+#DNA reservoir Violin plots: Tropism comparisons (R5 vs X4 vs Mixed)_Figure4 & supplementary figure4
+EC_persistent were excluded from analysis
+No data transformation.
+KW with post-hoc test
+For each subset and each variable:
+
+
+```{r}
+# ============================================================
+# Tropism comparisons + plots
+# Reservoir + RNA variables
+# FULL, INF_1y, cART_3Years, Post2014 subsets
+# Kruskal–Wallis + Dunn’s multiple comparisons (BH-adjusted)
+# P-value labels: 2 significant figures or <0.0001
+# RNA variables: keep zeros for statistics, remove zeros only for log plots
+# ============================================================
+
+# -----------------------------
+# READ
+# -----------------------------
+data <- read_excel(file_path)
+
+# -----------------------------
+# VARIABLES
+# -----------------------------
+columns_to_analyze <- c(
+  "Total_million_avg",
+  "Rainbow_DSI",
+  "Defective_Rainbow",
+  "intact_total_ratio",
+  "longLTR_cp_Mio",
+  "POL_cp_Mio"
+)
+
+rna_zero_keep_vars <- c("longLTR_cp_Mio", "POL_cp_Mio")
+
+# -----------------------------
+# COERCE NUMERICS
+# -----------------------------
+data <- data %>%
+  mutate(
+    TIME_NEG_TO_ART = suppressWarnings(as.numeric(TIME_NEG_TO_ART)),
+    EARLY_CART      = suppressWarnings(as.numeric(EARLY_CART)),
+    HIV_DATE        = suppressWarnings(as.numeric(HIV_DATE)),
+    across(
+      any_of(columns_to_analyze),
+      ~ suppressWarnings(as.numeric(.))
+    )
+  )
+
+# -----------------------------
+# FILTER BASE COHORT
+# -----------------------------
+data <- data %>%
+  filter(
+    CONTROLLER_1B != "EC_persistent",
+    Tropism %in% c("X4", "R5", "Mixed")
+  )
+
+columns_to_analyze <- intersect(columns_to_analyze, names(data))
+
+if (length(columns_to_analyze) == 0) {
+  stop("None of columns_to_analyze found in the dataset.")
+}
+
+# -----------------------------
+# COLORS + ORDERS
+# -----------------------------
+custom_colors <- c(
+  "R5" = "aquamarine3",
+  "X4" = "coral",
+  "Mixed" = "steelblue3"
+)
+
+tropism_order <- c("R5", "X4", "Mixed")
+
+# ============================================================
+# DEFINE SUBSETS
+# ============================================================
+df_full <- data
+
+subset_conditions <- list(
+  FULL        = df_full,
+  INF_1y      = df_full %>% filter(INF_date_known_1y == 1),
+  cART_3Years = df_full %>% filter(TIME_NEG_TO_ART <= 1095),
+  Post2014    = df_full %>% filter(!is.na(HIV_DATE) & HIV_DATE > 2014)
+)
+
+subset_order <- c("FULL", "INF_1y", "cART_3Years", "Post2014")
+
+# -----------------------------
+# P-VALUE FORMATTER
+# -----------------------------
+format_p <- function(p) {
+  ifelse(
+    is.na(p),
+    "NA",
+    ifelse(
+      p < 0.0001,
+      "<0.0001",
+      formatC(p, format = "g", digits = 2)
+    )
+  )
+}
+
+# -----------------------------
+# SUMMARIZE COUNTS
+# -----------------------------
+summary_df <- bind_rows(
+  lapply(names(subset_conditions), function(subset_name) {
+    subset_conditions[[subset_name]] %>%
+      filter(Tropism %in% tropism_order) %>%
+      group_by(Tropism) %>%
+      summarise(n = n(), .groups = "drop") %>%
+      mutate(Subset = subset_name)
+  })
+)
+
+print(summary_df)
+
+# ============================================================
+# Y-AXIS SCALE FUNCTION
+# ============================================================
+get_y_scale <- function(marker) {
+
+  if (marker %in% c("Total_million_avg", "Defective_Rainbow", "Rainbow_DSI")) {
+    return(
+      scale_y_log10(
+        limits = c(1e0, 1e5),
+        breaks = 10^(0:5),
+        labels = trans_format("log10", math_format(10^.x))
+      )
+    )
+  }
+
+  if (marker %in% c("intact_total_ratio")) {
+    return(
+      scale_y_log10(
+        limits = c(1e-3, 1),
+        breaks = c(1e-3, 1e-2, 1e-1, 1),
+        labels = c("0.001", "0.01", "0.1", "1")
+      )
+    )
+  }
+
+  if (marker %in% c("longLTR_cp_Mio", "POL_cp_Mio")) {
+    return(
+      list(
+        scale_y_log10(
+          breaks = 10^(-1:5),
+          labels = trans_format("log10", math_format(10^.x))
+        ),
+        coord_cartesian(ylim = c(0.1, 1e5), clip = "off")
+      )
+    )
+  }
+
+  NULL
+}
+
+# ============================================================
+# KRUSKAL–WALLIS + DUNN (BH) + PER-SUBSET PLOTS
+# ============================================================
+p_values_list <- list()
+
+for (subset_name in names(subset_conditions)) {
+
+  current_data <- subset_conditions[[subset_name]] %>%
+    filter(Tropism %in% tropism_order) %>%
+    mutate(Tropism = factor(Tropism, levels = tropism_order))
+
+  p_values_df <- data.frame()
+
+  for (column_name in columns_to_analyze) {
+
+    # -------------------------
+    # FILTER FOR STATISTICS
+    # RNA: keep zeros
+    # Other reservoir variables: >0 only
+    # -------------------------
+    if (column_name %in% rna_zero_keep_vars) {
+      df_filt <- current_data %>%
+        filter(
+          !is.na(.data[[column_name]]),
+          is.finite(.data[[column_name]])
+        )
+    } else {
+      df_filt <- current_data %>%
+        filter(
+          !is.na(.data[[column_name]]),
+          is.finite(.data[[column_name]]),
+          .data[[column_name]] > 0
+        )
+    }
+
+    df_filt <- df_filt %>%
+      mutate(Tropism = droplevels(Tropism))
+
+    if (nrow(df_filt) == 0) next
+    if (nlevels(df_filt$Tropism) < 2) next
+
+    # -------------------------
+    # GLOBAL KRUSKAL–WALLIS
+    # -------------------------
+    kw <- kruskal.test(df_filt[[column_name]] ~ df_filt$Tropism)
+    kw_p <- kw$p.value
+
+    # -------------------------
+    # DUNN POST-HOC BH
+    # -------------------------
+    dunn_res <- df_filt %>%
+      rstatix::dunn_test(
+        formula = as.formula(paste0("`", column_name, "` ~ Tropism")),
+        p.adjust.method = "BH"
+      ) %>%
+      mutate(
+        Group1 = as.character(group1),
+        Group2 = as.character(group2),
+        P_value = p,
+        Adjusted_P_value = p.adj
+      )
+
+    comparisons <- lapply(
+      seq_len(nrow(dunn_res)),
+      function(i) c(dunn_res$Group1[i], dunn_res$Group2[i])
+    )
+
+    raw_p_values <- dunn_res$P_value
+    adjusted_p_values <- dunn_res$Adjusted_P_value
+
+    # -------------------------
+    # MEDIAN/IQR FROM STATS DATA
+    # For RNA this includes zeros
+    # -------------------------
+    median_iqr <- df_filt %>%
+      group_by(Tropism) %>%
+      summarise(
+        Median = median(.data[[column_name]], na.rm = TRUE),
+        Q1 = quantile(.data[[column_name]], 0.25, na.rm = TRUE),
+        Q3 = quantile(.data[[column_name]], 0.75, na.rm = TRUE),
+        .groups = "drop"
+      )
+
+    # -------------------------
+    # STORE RESULTS
+    # -------------------------
+    for (i in seq_along(comparisons)) {
+
+      comp <- comparisons[[i]]
+
+      p_values_df <- rbind(
+        p_values_df,
+        data.frame(
+          Dataset = subset_name,
+          Column = column_name,
+          Analysis_Note = ifelse(
+            column_name %in% rna_zero_keep_vars,
+            "RNA stats: NA removed, zeros retained; plot excludes zeros for log scale",
+            "Positive values only"
+          ),
+          Group1 = comp[1],
+          Group2 = comp[2],
+          N_Group1 = sum(df_filt$Tropism == comp[1]),
+          N_Group2 = sum(df_filt$Tropism == comp[2]),
+          Zero_Group1 = ifelse(
+            column_name %in% rna_zero_keep_vars,
+            sum(df_filt$Tropism == comp[1] & df_filt[[column_name]] == 0, na.rm = TRUE),
+            NA
+          ),
+          Zero_Group2 = ifelse(
+            column_name %in% rna_zero_keep_vars,
+            sum(df_filt$Tropism == comp[2] & df_filt[[column_name]] == 0, na.rm = TRUE),
+            NA
+          ),
+          Median_Group1 = median(df_filt[[column_name]][df_filt$Tropism == comp[1]], na.rm = TRUE),
+          Median_Group2 = median(df_filt[[column_name]][df_filt$Tropism == comp[2]], na.rm = TRUE),
+          IQR_Group1 = paste0(
+            median_iqr$Q1[median_iqr$Tropism == comp[1]],
+            " - ",
+            median_iqr$Q3[median_iqr$Tropism == comp[1]]
+          ),
+          IQR_Group2 = paste0(
+            median_iqr$Q1[median_iqr$Tropism == comp[2]],
+            " - ",
+            median_iqr$Q3[median_iqr$Tropism == comp[2]]
+          ),
+          KW_P_value = kw_p,
+          KW_P_Label = format_p(kw_p),
+          P_value = raw_p_values[i],
+          Raw_P_Label = format_p(raw_p_values[i]),
+          Adjusted_P_value = adjusted_p_values[i],
+          Adj_P_Label = format_p(adjusted_p_values[i]),
+          Test = "Kruskal–Wallis + Dunn (BH)",
+          stringsAsFactors = FALSE
+        )
+      )
+    }
+
+    # -------------------------
+    # X-AXIS LABELS
+    # RNA: show n and zeros
+    # Other variables: show n
+    # -------------------------
+    if (column_name %in% rna_zero_keep_vars) {
+      n_labels <- df_filt %>%
+        group_by(Tropism) %>%
+        summarise(
+          n = n(),
+          zeros = sum(.data[[column_name]] == 0, na.rm = TRUE),
+          .groups = "drop"
+        ) %>%
+        mutate(label = paste0(Tropism, "\n(n=", n, ", 0s=", zeros, ")"))
+    } else {
+      n_labels <- df_filt %>%
+        group_by(Tropism) %>%
+        summarise(n = n(), .groups = "drop") %>%
+        mutate(label = paste0(Tropism, "\n(n=", n, ")"))
+    }
+
+    label_map <- setNames(n_labels$label, as.character(n_labels$Tropism))
+    valid_levels <- label_map[intersect(tropism_order, names(label_map))]
+
+    # -------------------------
+    # DATA FOR PLOTTING
+    # RNA: remove zeros only for log-axis plot
+    # -------------------------
+    if (column_name %in% rna_zero_keep_vars) {
+      df_plot <- df_filt %>%
+        filter(.data[[column_name]] > 0)
+    } else {
+      df_plot <- df_filt
+    }
+
+    df_plot <- df_plot %>%
+      mutate(
+        Tropism_n = factor(
+          label_map[as.character(Tropism)],
+          levels = valid_levels
+        )
+      )
+
+    if (nrow(df_plot) == 0) next
+
+    # -------------------------
+    # MEDIAN LABELS
+    # RNA: true median includes zeros, placement uses non-zero median
+    # -------------------------
+    if (column_name %in% rna_zero_keep_vars) {
+
+      median_labels <- df_filt %>%
+        group_by(Tropism) %>%
+        summarise(
+          true_median = median(.data[[column_name]], na.rm = TRUE),
+          .groups = "drop"
+        ) %>%
+        left_join(
+          df_plot %>%
+            group_by(Tropism) %>%
+            summarise(
+              y_pos = median(.data[[column_name]], na.rm = TRUE),
+              .groups = "drop"
+            ),
+          by = "Tropism"
+        ) %>%
+        mutate(
+          Tropism_n = factor(
+            label_map[as.character(Tropism)],
+            levels = valid_levels
+          )
+        )
+
+    } else {
+
+      median_labels <- df_plot %>%
+        group_by(Tropism) %>%
+        summarise(
+          true_median = median(.data[[column_name]], na.rm = TRUE),
+          y_pos = median(.data[[column_name]], na.rm = TRUE),
+          .groups = "drop"
+        ) %>%
+        mutate(
+          Tropism_n = factor(
+            label_map[as.character(Tropism)],
+            levels = valid_levels
+          )
+        )
+    }
+
+    # -------------------------
+    # VALID COMPARISONS FOR PLOT
+    # -------------------------
+    present_tropism <- levels(droplevels(df_plot$Tropism))
+
+    keep_idx <- sapply(
+      comparisons,
+      function(x) all(x %in% present_tropism)
+    )
+
+    valid_comparisons <- comparisons[keep_idx]
+    valid_adj_p <- adjusted_p_values[keep_idx]
+    valid_p_labels <- format_p(valid_adj_p)
+
+    valid_comparisons_labeled <- lapply(
+      valid_comparisons,
+      function(comp) unname(label_map[comp])
+    )
+
+    if (length(valid_comparisons) == 0) next
+
+    # -------------------------
+    # PLOT
+    # -------------------------
+    p <- ggplot(
+      df_plot,
+      aes(x = Tropism_n, y = .data[[column_name]], fill = Tropism)
+    ) +
+      geom_violin(trim = FALSE, alpha = 0.4) +
+      geom_jitter(
+        aes(color = Tropism),
+        width = 0.2,
+        alpha = 0.9,
+        size = 0.5
+      ) +
+      geom_boxplot(
+        width = 0.2,
+        outlier.shape = NA,
+        alpha = 0.5,
+        color = "black"
+      ) +
+      geom_text(
+        data = median_labels,
+        aes(x = Tropism_n, y = y_pos, label = signif(true_median, 3)),
+        vjust = -0.7,
+        size = 3.5,
+        fontface = "bold",
+        color = "black",
+        inherit.aes = FALSE
+      ) +
+      scale_fill_manual(values = custom_colors) +
+      scale_color_manual(values = custom_colors) +
+      get_y_scale(column_name) +
+      labs(
+        title = paste0(
+          column_name,
+          " - ",
+          subset_name,
+          " (KW p=",
+          format_p(kw_p),
+          ")"
+        ),
+        x = "",
+        y = column_name
+      ) +
+      theme_minimal() +
+      theme(
+        axis.text.x = element_text(size = 22, color = "black"),
+        axis.text.y = element_text(size = 22, color = "black")
+      ) +
+      geom_signif(
+        comparisons = valid_comparisons_labeled,
+        annotations = valid_p_labels,
+        tip_length = 0,
+        step_increase = 0.04,
+        textsize = 6
+      )
+
+    ggsave(
+      filename = paste0("R5X4_", column_name, "_", subset_name, ".pdf"),
+      plot = p,
+      width = 8,
+      height = 6
+    )
+  }
+
+  p_values_list[[subset_name]] <- p_values_df
+}
+
+# ============================================================
+# EXPORT SAME EXCEL
+# ============================================================
+write_xlsx(
+  p_values_list,
+  "Tropism_Comparisons_All_Datasets_KW_Dunn.xlsx"
+)
+
+# ============================================================
+# FACETED PLOTS
+# ============================================================
+plot_data <- bind_rows(
+  lapply(names(subset_conditions), function(nm) {
+    subset_conditions[[nm]] %>%
+      mutate(Subset = nm)
+  })
+) %>%
+  filter(Tropism %in% tropism_order) %>%
+  mutate(
+    Tropism = factor(Tropism, levels = tropism_order),
+    Subset = factor(Subset, levels = subset_order)
+  )
+
+plot_precomputed <- function(marker) {
+
+  if (marker %in% rna_zero_keep_vars) {
+    df_stats <- plot_data %>%
+      filter(
+        !is.na(.data[[marker]]),
+        is.finite(.data[[marker]])
+      )
+
+    df <- df_stats %>%
+      filter(.data[[marker]] > 0)
+
+  } else {
+    df_stats <- plot_data %>%
+      filter(
+        !is.na(.data[[marker]]),
+        is.finite(.data[[marker]]),
+        .data[[marker]] > 0
+      )
+
+    df <- df_stats
+  }
+
+  if (nrow(df) == 0) return(NULL)
+
+  if (marker %in% rna_zero_keep_vars) {
+    counts <- df_stats %>%
+      group_by(Subset, Tropism) %>%
+      summarise(
+        n = n(),
+        zeros = sum(.data[[marker]] == 0, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      mutate(Label = paste0(Tropism, " (n=", n, ", 0s=", zeros, ")"))
+  } else {
+    counts <- df_stats %>%
+      group_by(Subset, Tropism) %>%
+      summarise(n = n(), .groups = "drop") %>%
+      mutate(Label = paste0(Tropism, " (n=", n, ")"))
+  }
+
+  df <- df %>%
+    left_join(counts, by = c("Subset", "Tropism")) %>%
+    group_by(Subset) %>%
+    mutate(
+      Tropism_label = factor(
+        Label,
+        levels = Label[match(tropism_order, Tropism)]
+      ),
+      Tropism_num = as.numeric(factor(Tropism, levels = tropism_order))
+    ) %>%
+    ungroup()
+
+  signif_df <- bind_rows(p_values_list, .id = "Subset") %>%
+    filter(Column == marker) %>%
+    mutate(
+      P_Label = Adj_P_Label,
+      Subset = factor(Subset, levels = subset_order),
+      Group1_num = as.numeric(factor(Group1, levels = tropism_order)),
+      Group2_num = as.numeric(factor(Group2, levels = tropism_order)),
+      midpoint = (Group1_num + Group2_num) / 2
+    )
+
+  if (nrow(signif_df) == 0) return(NULL)
+
+  sig_use <- signif_df %>%
+    group_by(Subset) %>%
+    mutate(
+      y_pos = {
+        yy <- df[[marker]][df$Subset == first(Subset)]
+        max_y <- max(yy, na.rm = TRUE)
+        span_y <- diff(range(yy, na.rm = TRUE))
+        base_y <- max_y + span_y * 0.15
+        step <- span_y * 0.50
+        base_y + step * (row_number() - 1)
+      }
+    ) %>%
+    ungroup()
+
+  medians_df <- signif_df %>%
+    select(Subset, Group1, Median_Group1) %>%
+    rename(Tropism = Group1, Median = Median_Group1) %>%
+    bind_rows(
+      signif_df %>%
+        select(Subset, Group2, Median_Group2) %>%
+        rename(Tropism = Group2, Median = Median_Group2)
+    ) %>%
+    distinct() %>%
+    mutate(
+      Tropism_num = as.numeric(factor(Tropism, levels = tropism_order)),
+      label = signif(Median, 3),
+      y = ifelse(Median <= 0, NA, Median)
+    ) %>%
+    filter(!is.na(y))
+
+  ggplot(
+    df,
+    aes(x = Tropism_label, y = .data[[marker]], fill = Tropism)
+  ) +
+    geom_violin(trim = FALSE, alpha = 0.4) +
+    geom_jitter(
+      aes(color = Tropism),
+      width = 0.15,
+      size = 0.5,
+      alpha = 0.9
+    ) +
+    geom_boxplot(
+      width = 0.2,
+      outlier.shape = NA,
+      alpha = 0.6,
+      color = "black"
+    ) +
+    geom_segment(
+      data = sig_use,
+      aes(
+        x = Group1_num,
+        xend = Group2_num,
+        y = y_pos,
+        yend = y_pos
+      ),
+      inherit.aes = FALSE,
+      linewidth = 0.4
+    ) +
+    geom_text(
+      data = sig_use,
+      aes(
+        x = midpoint,
+        y = y_pos * 1.03,
+        label = P_Label
+      ),
+      inherit.aes = FALSE,
+      size = 4
+    ) +
+    geom_text(
+      data = medians_df,
+      aes(
+        x = Tropism_num,
+        y = y,
+        label = label
+      ),
+      inherit.aes = FALSE,
+      size = 3.5,
+      fontface = "bold"
+    ) +
+    facet_wrap(~ Subset, nrow = 1, scales = "free_x") +
+    scale_fill_manual(values = custom_colors) +
+    scale_color_manual(values = custom_colors) +
+    get_y_scale(marker) +
+    labs(
+      title = marker,
+      x = "Tropism",
+      y = marker
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+      axis.text.x = element_text(size = 13, color = "black"),
+      strip.text = element_text(face = "bold")
+    )
+}
+
+for (marker in columns_to_analyze) {
+  p <- plot_precomputed(marker)
+  if (is.null(p)) next
+
+  ggsave(
+    filename = paste0("FacetedR5X4_", marker, "_KW_Dunn.pdf"),
+    plot = p,
+    width = 28,
+    height = 8
+  )
+}
+
+getwd()
+```
+#distribution check
+```{r}
+# ============================================================
+# DISTRIBUTION CHECK: RAW vs LOG2 (FULL cohort)
+# Each Marker × Transform gets its OWN panel with independent axes
+# (facet_wrap free scales — raw and log never share an axis)
+# Log2 = log2(x) for >0 vars; log2(x+1) for RNA zero-keep vars
+# ============================================================
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+df_dist <- data %>%
+  filter(Tropism %in% tropism_order) %>%
+  mutate(Tropism = factor(Tropism, levels = tropism_order))
+
+dist_data <- bind_rows(lapply(columns_to_analyze, function(marker) {
+
+  raw_vals <- df_dist %>%
+    filter(!is.na(.data[[marker]])) %>%
+    transmute(Marker = marker, Tropism,
+              Transform = "Raw",
+              value = .data[[marker]])
+
+  if (marker %in% rna_zero_keep_vars) {
+    log_vals <- df_dist %>%
+      filter(!is.na(.data[[marker]]), .data[[marker]] >= 0) %>%
+      transmute(Marker = marker, Tropism,
+                Transform = "Log2",
+                value = log2(.data[[marker]] + 1))
+  } else {
+    log_vals <- df_dist %>%
+      filter(!is.na(.data[[marker]]), .data[[marker]] > 0) %>%
+      transmute(Marker = marker, Tropism,
+                Transform = "Log2",
+                value = log2(.data[[marker]]))
+  }
+
+  bind_rows(raw_vals, log_vals)
+}))
+
+dist_data <- dist_data %>%
+  mutate(
+    Marker    = factor(Marker, levels = columns_to_analyze),
+    Transform = factor(Transform, levels = c("Raw", "Log2"))
+  )
+
+# ============================================================
+# DENSITY — one panel per Marker × Transform, independent axes
+# Coloured by Tropism so group overlap is visible
+# (drop fill/color = Tropism for a single pooled density)
+# ============================================================
+p_dist <- ggplot(dist_data, aes(x = value, fill = Tropism, color = Tropism)) +
+  geom_density(alpha = 0.3) +
+  facet_wrap(~ Marker + Transform, scales = "free", ncol = 2) +
+  scale_fill_manual(values = custom_colors) +
+  scale_color_manual(values = custom_colors) +
+  labs(
+    title    = "Distribution check: Raw vs Log2 (FULL cohort)",
+    subtitle = "Log2 = log2(x) for >0 variables; log2(x+1) for RNA variables",
+    x = "Value", y = "Density"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(strip.text = element_text(face = "bold"))
+
+ggsave("FULL_Distribution_Check_Raw_vs_Log2_density.pdf",
+       p_dist, width = 12, height = 14)
+
+# ============================================================
+# BOXPLOT — one panel per Marker × Transform, free y
+# x = Tropism so you see per-group spread on each scale
+# ============================================================
+p_dist_box <- ggplot(dist_data, aes(x = Tropism, y = value, fill = Tropism)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+  geom_jitter(width = 0.15, alpha = 0.25, size = 0.4) +
+  facet_wrap(~ Marker + Transform, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = custom_colors) +
+  labs(
+    title = "Raw vs Log2 distribution by tropism (FULL cohort)",
+    x = "", y = "Value"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(strip.text = element_text(face = "bold"))
+
+ggsave("FULL_Distribution_Check_Raw_vs_Log2_boxplot.pdf",
+       p_dist_box, width = 12, height = 16)
+
+p_dist
+p_dist_box
+```
+
+#Parametric test
+
+```{r}
+# =====================================================================
+# Tropism reservoir comparison: R5 vs X4 vs Mixed
+# One-way ANOVA + Tukey HSD on a per-variable transform
+#   - intact_total_ratio  -> arcsine-sqrt  asin(sqrt(x))   (bounded proportion)
+#   - all other variables -> log2(x + 1)                    (copy-number-like)
+# Zeros are RETAINED for every variable (both transforms are defined at 0).
+# =====================================================================
+
+# -----------------------------
+# READ
+# -----------------------------
+data <- read_excel(file_path)
+
+setwd("R:/hcrc/Personal folders/Kavita Mehta/Manuscripts/2000HIV_Tropism/reservoir/log_parametric")
+
+# -----------------------------
+# VARIABLES
+# -----------------------------
+columns_to_analyze <- c(
+  "Total_million_avg",
+  "Rainbow_DSI",
+  "Defective_Rainbow",
+  "intact_total_ratio",
+  "longLTR_cp_Mio",
+  "POL_cp_Mio"
+)
+
+# Variables treated as bounded proportions (arcsine-sqrt instead of log2)
+ratio_vars <- c("intact_total_ratio")
+
+# -----------------------------
+# PER-VARIABLE TRANSFORM HELPERS
+# -----------------------------
+# Transform a value vector according to the variable type.
+transform_value <- function(x, marker) {
+  if (marker %in% ratio_vars) {
+    asin(sqrt(pmin(pmax(x, 0), 1)))   # arcsine-sqrt; clamps to [0,1] as a guard
+  } else {
+    log2(x + 1)                       # log2(x+1); zeros -> 0
+  }
+}
+
+# Human-readable description for the export tables.
+transform_label <- function(marker) {
+  if (marker %in% ratio_vars) {
+    "asin(sqrt(x)); proportion, zeros retained"
+  } else {
+    "log2(x + 1); zeros retained"
+  }
+}
+
+# Short tag for axis titles / plot labels.
+transform_tag <- function(marker) {
+  if (marker %in% ratio_vars) "asin(sqrt) " else "log2(x+1) "
+}
+
+# Validity filter for the raw values before transforming.
+valid_raw <- function(x, marker) {
+  if (marker %in% ratio_vars) {
+    is.finite(x) & x >= 0 & x <= 1
+  } else {
+    is.finite(x) & x >= 0
+  }
+}
+
+# -----------------------------
+# COERCE NUMERICS
+# -----------------------------
+data <- data %>%
+  mutate(
+    TIME_NEG_TO_ART = suppressWarnings(as.numeric(TIME_NEG_TO_ART)),
+    EARLY_CART      = suppressWarnings(as.numeric(EARLY_CART)),
+    HIV_DATE        = suppressWarnings(as.numeric(HIV_DATE)),
+    across(
+      any_of(columns_to_analyze),
+      ~ suppressWarnings(as.numeric(.))
+    )
+  )
+
+# -----------------------------
+# FILTER BASE COHORT
+# -----------------------------
+data <- data %>%
+  filter(
+    CONTROLLER_1B != "EC_persistent",
+    Tropism %in% c("X4", "R5", "Mixed")
+  )
+
+columns_to_analyze <- intersect(columns_to_analyze, names(data))
+
+if (length(columns_to_analyze) == 0) {
+  stop("None of columns_to_analyze found in the dataset.")
+}
+
+# -----------------------------
+# COLORS + ORDERS
+# -----------------------------
+custom_colors <- c(
+  "R5" = "aquamarine3",
+  "X4" = "coral",
+  "Mixed" = "steelblue3"
+)
+
+tropism_order <- c("R5", "X4", "Mixed")
+
+# ============================================================
+# DEFINE SUBSETS
+# ============================================================
+df_full <- data
+
+subset_conditions <- list(
+  FULL        = df_full,
+  INF_1y      = df_full %>% filter(INF_date_known_1y == 1),
+  cART_3Years = df_full %>% filter(TIME_NEG_TO_ART <= 1095),
+  Post2014    = df_full %>% filter(!is.na(HIV_DATE) & HIV_DATE > 2014)
+)
+
+subset_order <- c("FULL", "INF_1y", "cART_3Years", "Post2014")
+
+# -----------------------------
+# P-VALUE FORMATTER
+# -----------------------------
+format_p <- function(p) {
+  ifelse(
+    is.na(p),
+    "NA",
+    ifelse(
+      p < 0.0001,
+      "<0.0001",
+      formatC(p, format = "g", digits = 2)
+    )
+  )
+}
+
+# -----------------------------
+# SUMMARIZE COUNTS
+# -----------------------------
+summary_df <- bind_rows(
+  lapply(names(subset_conditions), function(subset_name) {
+    subset_conditions[[subset_name]] %>%
+      filter(Tropism %in% tropism_order) %>%
+      group_by(Tropism) %>%
+      summarise(n = n(), .groups = "drop") %>%
+      mutate(Subset = subset_name)
+  })
+)
+
+print(summary_df)
+
+# ============================================================
+# Y-AXIS SCALE FUNCTIONS
+# Proportions (arcsine) get a free axis so the signif brackets fit;
+# log2 variables keep the fixed window from before.
+# ============================================================
+get_y_scale <- function(marker) {
+  if (marker %in% ratio_vars) {
+    scale_y_continuous()
+  } else {
+    scale_y_continuous(
+      limits = c(-3, 16),
+      breaks = c(0, 5, 10, 15),
+      expand = expansion(mult = c(0.02, 0.20))
+    )
+  }
+}
+
+get_y_scale_faceted <- function(marker) {
+  scale_y_continuous(
+    n.breaks = 4
+  )
+}
+
+# ============================================================
+# TRANSFORM + ANOVA + TUKEY HSD (per-variable transform)
+# ============================================================
+p_values_list   <- list()
+assumption_list <- list()
+
+for (subset_name in names(subset_conditions)) {
+
+  current_data <- subset_conditions[[subset_name]] %>%
+    filter(Tropism %in% tropism_order) %>%
+    mutate(Tropism = factor(Tropism, levels = tropism_order))
+
+  p_values_df   <- data.frame()
+  assumption_df <- data.frame()
+
+  for (column_name in columns_to_analyze) {
+
+    trans_column <- paste0(column_name, "_trans")
+
+    # -------------------------
+    # FILTER + PER-VARIABLE TRANSFORM (zeros retained)
+    # -------------------------
+    df_filt <- current_data %>%
+      filter(valid_raw(.data[[column_name]], column_name)) %>%
+      mutate(
+        "{trans_column}" := transform_value(.data[[column_name]], column_name)
+      )
+
+    df_filt <- df_filt %>%
+      mutate(Tropism = droplevels(Tropism))
+
+    if (nrow(df_filt) == 0) next
+    if (nlevels(df_filt$Tropism) < 2) next
+
+    # -------------------------
+    # GLOBAL ONE-WAY ANOVA
+    # -------------------------
+    anova_model <- aov(
+      as.formula(paste0("`", trans_column, "` ~ Tropism")),
+      data = df_filt
+    )
+
+    anova_summary <- summary(anova_model)
+    anova_p <- anova_summary[[1]][["Pr(>F)"]][1]
+    anova_f <- anova_summary[[1]][["F value"]][1]
+
+    # -------------------------
+    # ASSUMPTION CHECKS (Shapiro on residuals, Bartlett for variances)
+    # -------------------------
+    shapiro_p  <- NA
+    bartlett_p <- NA
+
+    if (length(residuals(anova_model)) >= 3 && length(residuals(anova_model)) <= 5000) {
+      shapiro_p <- tryCatch(
+        shapiro.test(residuals(anova_model))$p.value,
+        error = function(e) NA
+      )
+    }
+
+    bartlett_p <- tryCatch(
+      bartlett.test(df_filt[[trans_column]] ~ df_filt$Tropism)$p.value,
+      error = function(e) NA
+    )
+
+    assumption_df <- rbind(
+      assumption_df,
+      data.frame(
+        Dataset = subset_name,
+        Column_original = column_name,
+        Column_tested = trans_column,
+        Transformation = transform_label(column_name),
+        N_total = nrow(df_filt),
+        N_groups = nlevels(df_filt$Tropism),
+        ANOVA_F_value = anova_f,
+        ANOVA_P_value = anova_p,
+        ANOVA_P_Label = format_p(anova_p),
+        Shapiro_residual_P_value = shapiro_p,
+        Shapiro_residual_P_Label = format_p(shapiro_p),
+        Bartlett_P_value = bartlett_p,
+        Bartlett_P_Label = format_p(bartlett_p),
+        stringsAsFactors = FALSE
+      )
+    )
+
+    # -------------------------
+    # TUKEY HSD POST-HOC (on transformed scale)
+    # -------------------------
+    tukey_res <- df_filt %>%
+      rstatix::tukey_hsd(
+        formula = as.formula(paste0("`", trans_column, "` ~ Tropism"))
+      ) %>%
+      mutate(
+        Group1 = as.character(group1),
+        Group2 = as.character(group2),
+        Difference_trans = estimate,
+        Lower_CI_trans = conf.low,
+        Upper_CI_trans = conf.high,
+        P_value = p.adj,
+        Adjusted_P_value = p.adj
+      )
+
+    comparisons <- lapply(
+      seq_len(nrow(tukey_res)),
+      function(i) c(tukey_res$Group1[i], tukey_res$Group2[i])
+    )
+
+    adjusted_p_values <- tukey_res$Adjusted_P_value
+
+    # -------------------------
+    # MEDIAN/IQR ORIGINAL SCALE
+    # -------------------------
+    median_iqr_original <- df_filt %>%
+      group_by(Tropism) %>%
+      summarise(
+        Median_original = median(.data[[column_name]], na.rm = TRUE),
+        Q1_original = quantile(.data[[column_name]], 0.25, na.rm = TRUE),
+        Q3_original = quantile(.data[[column_name]], 0.75, na.rm = TRUE),
+        Mean_original = mean(.data[[column_name]], na.rm = TRUE),
+        SD_original = sd(.data[[column_name]], na.rm = TRUE),
+        .groups = "drop"
+      )
+
+    # -------------------------
+    # MEAN/SD + MEDIAN/IQR TRANSFORMED SCALE
+    # -------------------------
+    summary_trans <- df_filt %>%
+      group_by(Tropism) %>%
+      summarise(
+        Mean_trans = mean(.data[[trans_column]], na.rm = TRUE),
+        SD_trans = sd(.data[[trans_column]], na.rm = TRUE),
+        Median_trans = median(.data[[trans_column]], na.rm = TRUE),
+        Q1_trans = quantile(.data[[trans_column]], 0.25, na.rm = TRUE),
+        Q3_trans = quantile(.data[[trans_column]], 0.75, na.rm = TRUE),
+        .groups = "drop"
+      )
+
+    # -------------------------
+    # STORE RESULTS
+    # -------------------------
+    for (i in seq_along(comparisons)) {
+
+      comp <- comparisons[[i]]
+
+      p_values_df <- rbind(
+        p_values_df,
+        data.frame(
+          Dataset = subset_name,
+          Column_original = column_name,
+          Column_tested = trans_column,
+          Transformation = transform_label(column_name),
+          Transform_scale = ifelse(column_name %in% ratio_vars, "arcsine-sqrt", "log2(x+1)"),
+          Test = "One-way ANOVA + Tukey HSD on transformed values",
+
+          Group1 = comp[1],
+          Group2 = comp[2],
+
+          N_Group1 = sum(df_filt$Tropism == comp[1]),
+          N_Group2 = sum(df_filt$Tropism == comp[2]),
+
+          Zero_Group1 = sum(df_filt$Tropism == comp[1] & df_filt[[column_name]] == 0, na.rm = TRUE),
+          Zero_Group2 = sum(df_filt$Tropism == comp[2] & df_filt[[column_name]] == 0, na.rm = TRUE),
+
+          Mean_Group1_trans = summary_trans$Mean_trans[summary_trans$Tropism == comp[1]],
+          Mean_Group2_trans = summary_trans$Mean_trans[summary_trans$Tropism == comp[2]],
+
+          SD_Group1_trans = summary_trans$SD_trans[summary_trans$Tropism == comp[1]],
+          SD_Group2_trans = summary_trans$SD_trans[summary_trans$Tropism == comp[2]],
+          
+          Mean_Group1_original = median_iqr_original$Mean_original[median_iqr_original$Tropism == comp[1]],
+          Mean_Group2_original = median_iqr_original$Mean_original[median_iqr_original$Tropism == comp[2]],
+
+          SD_Group1_original = median_iqr_original$SD_original[median_iqr_original$Tropism == comp[1]],
+          SD_Group2_original = median_iqr_original$SD_original[median_iqr_original$Tropism == comp[2]],
+          
+          
+          Median_Group1_original = median_iqr_original$Median_original[median_iqr_original$Tropism == comp[1]],
+          Median_Group2_original = median_iqr_original$Median_original[median_iqr_original$Tropism == comp[2]],
+
+          IQR_Group1_original = paste0(
+            median_iqr_original$Q1_original[median_iqr_original$Tropism == comp[1]], " - ",
+            median_iqr_original$Q3_original[median_iqr_original$Tropism == comp[1]]
+          ),
+          IQR_Group2_original = paste0(
+            median_iqr_original$Q1_original[median_iqr_original$Tropism == comp[2]], " - ",
+            median_iqr_original$Q3_original[median_iqr_original$Tropism == comp[2]]
+          ),
+
+          Difference_trans = tukey_res$Difference_trans[i],
+          Lower_CI_trans = tukey_res$Lower_CI_trans[i],
+          Upper_CI_trans = tukey_res$Upper_CI_trans[i],
+
+          ANOVA_F_value = anova_f,
+          ANOVA_P_value = anova_p,
+          ANOVA_P_Label = format_p(anova_p),
+
+          Tukey_Adjusted_P_value = adjusted_p_values[i],
+          Tukey_Adj_P_Label = format_p(adjusted_p_values[i]),
+
+          Shapiro_residual_P_value = shapiro_p,
+          Bartlett_P_value = bartlett_p,
+
+          stringsAsFactors = FALSE
+        )
+      )
+    }
+
+    # -------------------------
+    # X-AXIS LABELS (show n and zeros for all variables)
+    # -------------------------
+    n_labels <- df_filt %>%
+      group_by(Tropism) %>%
+      summarise(
+        n = n(),
+        zeros = sum(.data[[column_name]] == 0, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      mutate(label = paste0(Tropism, "\n(n=", n, ", 0s=", zeros, ")"))
+
+    label_map <- setNames(n_labels$label, as.character(n_labels$Tropism))
+    valid_levels <- label_map[intersect(tropism_order, names(label_map))]
+
+    df_plot <- df_filt %>%
+      mutate(
+        Tropism_n = factor(label_map[as.character(Tropism)], levels = valid_levels)
+      )
+
+    if (nrow(df_plot) == 0) next
+
+    # -------------------------
+    # MEDIAN LABELS (original-scale median, placed at transformed median)
+    # -------------------------
+    median_labels <- df_plot %>%
+      group_by(Tropism) %>%
+      summarise(
+        true_median_original = median(.data[[column_name]], na.rm = TRUE),
+        y_pos = median(.data[[trans_column]], na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        Tropism_n = factor(label_map[as.character(Tropism)], levels = valid_levels)
+      )
+
+    # -------------------------
+    # VALID COMPARISONS FOR PLOT
+    # -------------------------
+    present_tropism <- levels(droplevels(df_plot$Tropism))
+
+    keep_idx <- sapply(comparisons, function(x) all(x %in% present_tropism))
+
+    valid_comparisons <- comparisons[keep_idx]
+    valid_adj_p <- adjusted_p_values[keep_idx]
+    valid_p_labels <- format_p(valid_adj_p)
+
+    valid_comparisons_labeled <- lapply(
+      valid_comparisons, function(comp) unname(label_map[comp])
+    )
+
+    if (length(valid_comparisons) == 0) next
+
+    # -------------------------
+    # PLOT ON TRANSFORMED VALUES
+    # -------------------------
+    p <- ggplot(
+      df_plot,
+      aes(x = Tropism_n, y = .data[[trans_column]], fill = Tropism)
+    ) +
+      geom_violin(trim = FALSE, alpha = 0.4) +
+      geom_jitter(aes(color = Tropism), width = 0.2, alpha = 0.9, size = 0.5) +
+      geom_boxplot(width = 0.2, outlier.shape = NA, alpha = 0.5, color = "black") +
+      geom_text(
+        data = median_labels,
+        aes(x = Tropism_n, y = y_pos, label = signif(true_median_original, 3)),
+        vjust = -0.7, size = 3.5, fontface = "bold", color = "black", inherit.aes = FALSE
+      ) +
+      scale_fill_manual(values = custom_colors) +
+      scale_color_manual(values = custom_colors) +
+      get_y_scale(column_name) +
+      labs(
+        title = paste0(
+          column_name, " - ", subset_name, " ",
+          transform_tag(column_name), "ANOVA p=", format_p(anova_p)
+        ),
+        x = "",
+        y = paste0(transform_tag(column_name), column_name)
+      ) +
+      theme_minimal() +
+      theme(
+        axis.text.x = element_text(size = 22, color = "black"),
+        axis.text.y = element_text(size = 22, color = "black")
+      ) +
+      geom_signif(
+        comparisons = valid_comparisons_labeled,
+        annotations = valid_p_labels,
+        tip_length = 0, step_increase = 0.04, textsize = 6
+      )
+
+    ggsave(
+      filename = paste0("R5X4_", column_name, "_", subset_name, "_ANOVA_Tukey.pdf"),
+      plot = p, width = 8, height = 6
+    )
+  }
+
+  p_values_list[[subset_name]]   <- p_values_df
+  assumption_list[[subset_name]] <- assumption_df
+}
+
+# ============================================================
+# EXPORT EXCEL
+# ============================================================
+write_xlsx(
+  c(
+    p_values_list,
+    list(ANOVA_Assumption_Checks = bind_rows(assumption_list))
+  ),
+  "Tropism_Comparisons_All_Datasets_ANOVA_Tukey.xlsx"
+)
+
+# ============================================================
+# FACETED PLOTS
+# ============================================================
+plot_data <- bind_rows(
+  lapply(names(subset_conditions), function(nm) {
+    subset_conditions[[nm]] %>% mutate(Subset = nm)
+  })
+) %>%
+  filter(Tropism %in% tropism_order) %>%
+  mutate(
+    Tropism = factor(Tropism, levels = tropism_order),
+    Subset = factor(Subset, levels = subset_order)
+  )
+
+plot_precomputed <- function(marker) {
+
+  trans_marker <- paste0(marker, "_trans")
+
+  df <- plot_data %>%
+    filter(valid_raw(.data[[marker]], marker)) %>%
+    mutate("{trans_marker}" := transform_value(.data[[marker]], marker))
+
+  if (nrow(df) == 0) return(NULL)
+
+  counts <- df %>%
+    group_by(Subset, Tropism) %>%
+    summarise(
+      n = n(),
+      zeros = sum(.data[[marker]] == 0, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(Label = paste0(Tropism, " (n=", n, ", 0s=", zeros, ")"))
+
+  df <- df %>%
+    left_join(counts, by = c("Subset", "Tropism")) %>%
+    group_by(Subset) %>%
+    mutate(
+      Tropism_label = factor(Label, levels = Label[match(tropism_order, Tropism)]),
+      Tropism_num = as.numeric(factor(Tropism, levels = tropism_order))
+    ) %>%
+    ungroup()
+
+  signif_df <- bind_rows(p_values_list, .id = "Subset") %>%
+    filter(Column_original == marker) %>%
+    mutate(
+      P_Label = Tukey_Adj_P_Label,
+      Subset = factor(Subset, levels = subset_order),
+      Group1_num = as.numeric(factor(Group1, levels = tropism_order)),
+      Group2_num = as.numeric(factor(Group2, levels = tropism_order)),
+      midpoint = (Group1_num + Group2_num) / 2
+    )
+
+  if (nrow(signif_df) == 0) return(NULL)
+
+  sig_use <- signif_df %>%
+    group_by(Subset) %>%
+    mutate(
+      y_pos = {
+        yy <- df[[trans_marker]][df$Subset == first(Subset)]
+        max_y <- max(yy, na.rm = TRUE)
+        span_y <- diff(range(yy, na.rm = TRUE))
+        ifelse(span_y == 0, max_y + 1, max_y + span_y * 0.05) +
+          ifelse(span_y == 0, 1, span_y * 0.05) * (row_number() - 1)
+      }
+    ) %>%
+    ungroup()
+
+  medians_df <- df %>%
+    group_by(Subset, Tropism) %>%
+    summarise(
+      Median_original = median(.data[[marker]], na.rm = TRUE),
+      Median_trans = median(.data[[trans_marker]], na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      Tropism_num = as.numeric(factor(Tropism, levels = tropism_order)),
+      label = signif(Median_original, 3),
+      y = Median_trans
+    )
+
+  ggplot(
+    df,
+    aes(x = Tropism_label, y = .data[[trans_marker]], fill = Tropism)
+  ) +
+    geom_violin(trim = FALSE, alpha = 0.4) +
+    geom_jitter(aes(color = Tropism), width = 0.15, size = 0.5, alpha = 0.9) +
+    geom_boxplot(width = 0.2, outlier.shape = NA, alpha = 0.6, color = "black") +
+    geom_segment(
+      data = sig_use,
+      aes(x = Group1_num, xend = Group2_num, y = y_pos, yend = y_pos),
+      inherit.aes = FALSE, linewidth = 0.4
+    ) +
+    geom_text(
+      data = sig_use,
+      aes(x = midpoint, y = y_pos, label = P_Label),
+      inherit.aes = FALSE, size = 4
+    ) +
+    geom_text(
+      data = medians_df,
+      aes(x = Tropism_num, y = y, label = label),
+      inherit.aes = FALSE, size = 3.5, fontface = "bold"
+    ) +
+    facet_wrap(~ Subset, nrow = 1, scales = "free_x") +
+    scale_fill_manual(values = custom_colors) +
+    scale_color_manual(values = custom_colors) +
+    get_y_scale_faceted(marker) +
+    labs(
+      title = paste0(marker, " ", transform_tag(marker), "ANOVA + Tukey"),
+      x = "Tropism",
+      y = paste0(transform_tag(marker), marker)
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+      axis.text.x = element_text(size = 13, color = "black"),
+      strip.text = element_text(face = "bold")
+    )
+}
+
+for (marker in columns_to_analyze) {
+  p <- plot_precomputed(marker)
+  if (is.null(p)) next
+
+  ggsave(
+    filename = paste0("FacetedR5X4_", marker, "_ANOVA_Tukey.pdf"),
+    plot = p, width = 28, height = 8
+  )
+}
+
+# ============================================================
+# DISTRIBUTION CHECK: Raw vs Transformed (per-variable transform)
+# log2(x+1) for copy-number variables, arcsine-sqrt for the ratio.
+# Built on the FULL cohort, density by Tropism.
+# ============================================================
+dist_subset <- "FULL"   # change to any name in subset_conditions
+ 
+dist_base <- subset_conditions[[dist_subset]] %>%
+  filter(Tropism %in% tropism_order) %>%
+  mutate(Tropism = factor(Tropism, levels = tropism_order))
+ 
+dist_long <- bind_rows(lapply(columns_to_analyze, function(marker) {
+ 
+  d <- dist_base %>%
+    filter(valid_raw(.data[[marker]], marker)) %>%
+    transmute(
+      Tropism,
+      Marker = marker,
+      Raw       = .data[[marker]],
+      Transform = transform_value(.data[[marker]], marker)
+    )
+ 
+  if (nrow(d) == 0) return(NULL)
+ 
+  # tidy to long: one row per (sample, scale)
+  bind_rows(
+    d %>% transmute(Tropism, Marker, Scale = "Raw",       Value = Raw),
+    d %>% transmute(
+      Tropism, Marker,
+      Scale = trimws(transform_tag(marker)),   # "log2(x+1)" or "asin(sqrt)"
+      Value = Transform
+    )
+  )
+}))
+ 
+# Panel order: each marker's Raw then its Transform, side by side (ncol = 2)
+panel_levels <- unlist(lapply(columns_to_analyze, function(m) {
+  c(paste0(m, "\nRaw"), paste0(m, "\n", trimws(transform_tag(m))))
+}))
+ 
+dist_long <- dist_long %>%
+  mutate(
+    Panel = factor(paste0(Marker, "\n", Scale), levels = panel_levels)
+  )
+ 
+p_dist <- ggplot(dist_long, aes(x = Value, fill = Tropism, color = Tropism)) +
+  geom_density(alpha = 0.35, linewidth = 0.4) +
+  facet_wrap(~ Panel, scales = "free", ncol = 2) +
+  scale_fill_manual(values = custom_colors) +
+  scale_color_manual(values = custom_colors) +
+  labs(
+    title = paste0("Distribution check: Raw vs Transformed (", dist_subset, " cohort)"),
+    subtitle = "Transform: log2(x+1) for copy-number variables; arcsine-sqrt for intact_total_ratio",
+    x = "Value",
+    y = "Density"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    strip.text = element_text(face = "bold", size = 10),
+    legend.position = "right"
+  )
+ 
+ggsave(
+  filename = paste0("FULL_Distribution_Check_Raw_vs_Transformed_", dist_subset, ".pdf"),
+  plot = p_dist, width = 10, height = 14
+)
+ 
+getwd()
+```
+
+#forestplot reservoir
+FOREST PLOT: Tropism effect (X4 vs R5) on reservoir outcomes
+Outcomes are analyzed on log2 scale:
+we looked into total and Intact (Rainbow) reservoir
+- log2(Total_million_avg)
+- log2(Rainbow_DSI)
+
+For each subset, we fit:
+1) Unadjusted model:   log2(outcome) ~ Tropism
+2) Adjusted model:     log2(outcome) ~ Tropism + covariates
+for Intact reservoir, the total resrvoir size was also corrected for
+
+Then we extract the coefficient for TropismX4 (difference in log2 scale)
+and plot betas + 95% CI as a forest plot.
+the beta coefficient and other details (based on excel output) in figure were added using Adobe illustrator.
+```{r}
+# ====== Tropism Effect on log(Total_million_avg) & log(Rainbow_DSI): Unadjusted vs Adjusted ======
+
+# ---- 0) LOAD LIBRARIES ----
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(tibble)
+  library(ggplot2)
+  library(purrr)
+  library(openxlsx)
+  library(tidyr)
+  library(lubridate)
+})
+
+# ---- 1) READ DATA ----
+df_full <- read_excel("R:/hcrc/Personal folders/Kavita Mehta/2000HIV/clinical data/KAVITA_IMPUT_DATAFRAME_SMOKING_CURRENT_RESOLVED.xlsx")
+setwd("R:/hcrc/Personal folders/Kavita Mehta/Manuscripts/2000HIV_Tropism/reservoir")
+
+df_full <- df_full %>%
+  mutate(
+    TIME_NEG_TO_ART   = suppressWarnings(as.numeric(TIME_NEG_TO_ART)),
+    AGE               = suppressWarnings(as.numeric(AGE)),
+    Total_million_avg = suppressWarnings(as.numeric(Total_million_avg)),
+    Rainbow_DSI       = suppressWarnings(as.numeric(Rainbow_DSI))
+  )
+# ---- 2) DEFINE SUBSETS ----
+subset_list <- list(
+  FULL        = df_full,
+  INF_1y      = df_full %>% dplyr::filter(INF_date_known_1y == 1),
+  cART_3Years <- df_full %>% 
+  dplyr::filter(suppressWarnings(as.numeric(TIME_NEG_TO_ART)) <= 1095,
+                TIME_NEG_DIAG == 1)
+  #post2014  = df_full %>% dplyr::filter(HIV_DATE > 2014)
+)
+
+# ---- 3) VARIABLE-SPECIFIC COVARIATES ----
+covariate_map <- list(
+  Total_million_avg = c("AGE", "SEX_BIRTH"),
+  Rainbow_DSI       = c("AGE", "SEX_BIRTH", "Total_million_avg")
+)
+
+# ---- 4) OUTCOME VARIABLES ----
+vars <- c("Total_million_avg", "Rainbow_DSI")
+
+# ---- 5) FIT MODELS & COLLECT RESULTS ----
+results <- purrr::imap_dfr(subset_list, function(df0, subset_name) {
+  # Filter to R5/X4 only and set factor order
+  df <- df0 %>%
+    dplyr::filter(Tropism %in% c("R5", "X4"), CONTROLLER_1B != "EC_persistent") %>%
+    dplyr::mutate(Tropism = factor(Tropism, levels = c("R5", "X4")))
+
+  purrr::map_dfr(vars, function(var) {
+
+    # Prepare analysis df: numeric, >0 for log2, then log-transform
+    df1 <- df %>%
+      dplyr::mutate(.y = suppressWarnings(as.numeric(.data[[var]]))) %>%
+      dplyr::mutate(.y = ifelse(.y > 0, .y, NA_real_)) %>%
+      dplyr::filter(!is.na(.y)) %>%
+      dplyr::mutate(log_var = log2(.y))
+    
+   # --- Usable N by group for this variable (post >0 + non-NA + log filter) ---
+n_used <- df1 %>%
+  dplyr::count(Tropism) %>%
+  tidyr::pivot_wider(names_from = Tropism, values_from = n, values_fill = 0)
+
+N_R5_used    <- n_used[["R5"]]
+N_X4_used    <- n_used[["X4"]]
+N_total_used <- N_R5_used + N_X4_used
+
+    # Bail if too few rows or only one Tropism level
+    if (nrow(df1) < 3 || length(unique(df1$Tropism)) < 2) {
+      return(tibble::tibble(
+        Subset = subset_name, Variable = var, Model = c("Unadjusted","Adjusted"),
+        Estimate = NA_real_, CI_Lower = NA_real_, CI_Upper = NA_real_, P_value = NA_real_,
+        N = nrow(df1), Covariates = NA_character_
+      ))
+    }
+
+    # --- Build covariate set ---
+    base_covs <- covariate_map[[var]]
+    if (is.null(base_covs)) base_covs <- character(0)
+
+    # Extra covariates only for INF_1y (use those present)
+    extra_covs <- character(0)
+    if (identical(subset_name, "INF_1y")) {
+      candidates <- c("TIMETOCART", "CART_DURATION")
+      extra_covs <- intersect(candidates, names(df1))
+    }
+
+    covs <- intersect(c(base_covs, extra_covs), names(df1))
+
+    # Coerce character covariates to factors (do NOT coerce to numeric)
+    for (cv in covs) {
+      if (is.character(df1[[cv]])) df1[[cv]] <- factor(df1[[cv]])
+    }
+
+    # --- Fit models ---
+    f_unadj <- stats::as.formula("log_var ~ Tropism")
+    m_unadj <- stats::lm(f_unadj, data = df1)
+
+    f_adj <- if (length(covs)) {
+      stats::as.formula(paste0("log_var ~ Tropism + ", paste(covs, collapse = " + ")))
+    } else {
+      f_unadj
+    }
+    m_adj <- stats::lm(f_adj, data = df1)
+
+    # Extractor for the TropismX4 coefficient
+    pull_row <- function(fit) {
+      cf <- summary(fit)$coefficients
+      if (!"TropismX4" %in% rownames(cf)) {
+        return(tibble::tibble(Estimate = NA_real_, CI_Lower = NA_real_, CI_Upper = NA_real_, P_value = NA_real_))
+      }
+      est <- cf["TropismX4", "Estimate"]
+      p   <- cf["TropismX4", "Pr(>|t|)"]
+      ci  <- suppressWarnings(stats::confint(fit, "TropismX4", level = 0.95))
+      tibble::tibble(
+        Estimate = est, CI_Lower = ci[1], CI_Upper = ci[2], P_value = p
+      )
+    }
+
+    out_unadj <- pull_row(m_unadj) %>% dplyr::mutate(Model = "Unadjusted")
+    out_adj   <- pull_row(m_adj)   %>% dplyr::mutate(Model = "Adjusted")
+
+dplyr::bind_rows(out_unadj, out_adj) %>%
+  dplyr::mutate(
+    Subset = subset_name,
+    Variable = var,
+    N_total_used = N_total_used,
+    N_R5_used    = N_R5_used,
+    N_X4_used    = N_X4_used,
+    Covariates = dplyr::case_when(
+      Model == "Adjusted" & length(covs) ~ paste(covs, collapse = ", "),
+      Model == "Adjusted"                ~ "none",
+      TRUE                               ~ "none"
+    )
+  ) %>%
+  dplyr::select(Subset, Variable, Model,
+                Estimate, CI_Lower, CI_Upper, P_value,
+                N_total_used, N_R5_used, N_X4_used, Covariates)
+
+  })
+})
+
+# ---- 6A) ADD OVERALL R5/X4 COUNTS (pre log-filter) PER SUBSET ----
+tropism_stats <- purrr::imap_dfr(subset_list, function(df0, subset_name) {
+  df <- df0 %>%
+    dplyr::filter(Tropism %in% c("R5", "X4"), CONTROLLER_1B != "EC_persistent")
+
+  counts <- df %>%
+    dplyr::count(Tropism) %>%
+    dplyr::mutate(Subset = subset_name) %>%
+    tidyr::pivot_wider(names_from = Tropism, values_from = n, values_fill = 0) %>%
+    dplyr::mutate(
+      Total = R5 + X4,
+      Pct_R5 = round(100 * R5 / Total, 1),
+      Pct_X4 = round(100 * X4 / Total, 1)
+    ) %>%
+    dplyr::select(
+      Subset,
+      N_R5 = R5, Pct_R5,
+      N_X4 = X4, Pct_X4
+    )
+
+  counts
+})
+
+results <- dplyr::left_join(results, tropism_stats, by = "Subset")
+
+# ---- 6B) SAVE RESULTS (MODELS ONLY) ----
+wb1 <- openxlsx::createWorkbook()
+openxlsx::addWorksheet(wb1, "Tropism_Log_Results")
+openxlsx::writeData(wb1, "Tropism_Log_Results", results)
+openxlsx::saveWorkbook(wb1, "Tropism_Log_Total_Rainbow_log2.xlsx", overwrite = TRUE)
+
+# ---- 6C) MEDIANS (and IQR) BY TROPISM, PER SUBSET & VARIABLE ----
+median_tbl <- purrr::imap_dfr(subset_list, function(df0, subset_name) {
+  df <- df0 %>%
+    dplyr::filter(Tropism %in% c("R5","X4"), CONTROLLER_1B != "EC_persistent")
+
+  purrr::map_dfr(vars, function(var) {
+    df %>%
+      dplyr::filter(!is.na(.data[[var]])) %>%
+      dplyr::group_by(Tropism) %>%
+      dplyr::summarise(
+        N      = dplyr::n(),
+        Median = stats::median(.data[[var]], na.rm = TRUE),
+        Q1     = stats::quantile(.data[[var]], 0.25, na.rm = TRUE, type = 2),
+        Q3     = stats::quantile(.data[[var]], 0.75, na.rm = TRUE, type = 2),
+        .groups = "drop"
+      ) %>%
+      dplyr::mutate(
+        IQR = Q3 - Q1,
+        Subset = subset_name,
+        Variable = var
+      ) %>%
+      dplyr::select(Subset, Variable, Tropism, N, Median, Q1, Q3, IQR)
+  })
+})
+
+median_wide <- median_tbl %>%
+  tidyr::pivot_wider(
+    names_from  = Tropism,
+    values_from = c(N, Median, Q1, Q3, IQR),
+    names_sep   = "_"
+  ) %>%
+  dplyr::relocate(Subset, Variable)
+
+# ---- 6D) SAVE RESULTS + MEDIANS TO EXCEL ----
+wb2 <- openxlsx::createWorkbook()
+openxlsx::addWorksheet(wb2, "Tropism_Log_Results")
+openxlsx::writeData(wb2, "Tropism_Log_Results", results)
+
+openxlsx::addWorksheet(wb2, "Medians_by_Tropism_long")
+openxlsx::writeData(wb2, "Medians_by_Tropism_long", median_tbl)
+
+openxlsx::addWorksheet(wb2, "Medians_by_Tropism_wide")
+openxlsx::writeData(wb2, "Medians_by_Tropism_wide", median_wide)
+
+openxlsx::saveWorkbook(wb2, "Tropism_Log_Total_Rainbow_log10.xlsx", overwrite = TRUE)
+
+# ---- 7) FORMAT FOR PLOTTING ----
+subset_levels <- c("cART_3Years", "INF_1y", "FULL")
+results_plot <- results %>%
+  dplyr::mutate(
+    Subset   = factor(Subset, subset_levels),
+    y0       = as.numeric(Subset),
+    shift    = if_else(Model == "Unadjusted", 0.2, -0.2),
+    y_plot   = y0 + shift,
+    Variable = factor(Variable, vars),
+    p_lab    = if_else(P_value < 0.001, "<0.001", sprintf("%.3f", P_value))
+  )
+
+# Shared x-axis across facets: compute global CI bounds
+x_min <- min(results_plot$CI_Lower, na.rm = TRUE)
+x_max <- max(results_plot$CI_Upper, na.rm = TRUE)
+
+# ---- 8) FOREST PLOT ----
+p <- ggplot(results_plot, aes(x = Estimate, y = y_plot, color = Model)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbarh(aes(xmin = CI_Lower, xmax = CI_Upper), height = 0.1, size = 0.8) +
+  geom_point(size = 3) +
+  geom_text(aes(label = p_lab), hjust = -0.2, size = 3) +
+  scale_y_continuous(
+    breaks = seq_along(subset_levels),
+    labels = subset_levels
+  ) +
+  scale_color_manual(values = c(Unadjusted = "black", Adjusted = "brown")) +
+  facet_wrap(~ Variable, ncol = 1) +  # shared x-axis across facets
+  labs(
+    x = expression("β (difference in log"[2]*" scale) for X4 vs R5"),
+    y = NULL,
+    title = "Unadjusted (black, top) vs Adjusted (brown, bottom)\nTropism Effect on log2(Total_million_avg) & log2(Rainbow_DSI)",
+    color = ""
+  ) +
+  xlim(x_min, x_max) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(face = "bold"),
+    legend.position = "bottom",
+    panel.spacing = grid::unit(3, "lines")
+  )
+
+# ---- 9) SAVE & DISPLAY PLOT ----
+print(p)
+ggsave("Forest_Total_Rainbow_log2.pdf", p, width = 10, height = 6)
+```
+
+#reservoir and different covariates
+```{r}
+# ============================================================
+# CHUNK — Reservoir analysis (FULL cohort only) with confounder sets
+# Outcomes: Total_million_avg, Rainbow_DSI
+# Compare X4 vs R5 (exclude EC_persistent), log2-transform outcomes (>0)
+# Runs lm() for each outcome × confounder-set and exports results + medians
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(tibble)
+  library(openxlsx)
+})
+
+# ---- 1) READ DATA + SET WD ----
+df_full <- read_excel("R:/hcrc/Personal folders/Kavita Mehta/2000HIV/clinical data/KAVITA_IMPUT_DATAFRAME_SMOKING_CURRENT_RESOLVED.xlsx")
+setwd("R:/hcrc/Personal folders/Kavita Mehta/Manuscripts/2000HIV_Tropism/reservoir")
+
+# ---- 2) CONFIG ----
+outcomes <- c("Total_million_avg", "Rainbow_DSI")
+
+# confounder sets (as you specified)
+confounder_sets <- list(
+  NONE               = character(0),
+  AGE                = c("AGE"),
+  SEX                = c("SEX_BIRTH"),
+  AGE_SEX            = c("AGE","SEX_BIRTH"),
+  AGE_SEX_TIMETOcART = c("AGE","SEX_BIRTH","TIMETOCART"),
+  AGE_SEX_CD4NADIR   = c("AGE","SEX_BIRTH","CD4_NADIR"),
+  AGE_SEX_VL   = c("AGE","SEX_BIRTH","VL_ZENITH"),
+  AGE_SEX_TIMETOCART_CD4NADIR   = c("AGE","SEX_BIRTH","TIMETOCART","CD4_NADIR"),
+  AGE_SEX_TIMETOCART_CD4NADIR_VL   = c("AGE","SEX_BIRTH","TIMETOCART","CD4_NADIR","VL_ZENITH")
+)
+
+# ---- 3) BASE FILTER (FULL cohort only) ----
+df0 <- df_full %>%
+  filter(
+    Tropism %in% c("R5","X4"),
+    CONTROLLER_1B != "EC_persistent"
+  ) %>%
+  mutate(Tropism = factor(Tropism, levels = c("R5","X4")))
+
+# overall N by tropism (pre log-filter)
+tropism_counts_overall <- df0 %>%
+  count(Tropism) %>%
+  tidyr::pivot_wider(names_from = Tropism, values_from = n, values_fill = 0) %>%
+  mutate(
+    N_total = R5 + X4,
+    Pct_R5 = round(100 * R5 / N_total, 1),
+    Pct_X4 = round(100 * X4 / N_total, 1)
+  )
+
+# ---- 4) HELPERS ----
+to_num <- function(x) suppressWarnings(as.numeric(x))
+
+# clean a covariate in df: handle blanks + NA consistently
+clean_covariate <- function(df, cv) {
+  x <- df[[cv]]
+
+  # If factor, convert to character first so we can trim blanks
+  if (is.factor(x)) x <- as.character(x)
+
+  # Character: trim and set "" to NA, then factor again
+  if (is.character(x)) {
+    x <- trimws(x)
+    x[x == ""] <- NA_character_
+    df[[cv]] <- factor(x)
+    return(df)
+  }
+
+  # Logical: keep as is
+  if (is.logical(x)) {
+    df[[cv]] <- x
+    return(df)
+  }
+
+  # Everything else: try numeric coercion (covers "numeric stored as text")
+  df[[cv]] <- suppressWarnings(as.numeric(x))
+  df
+}
+
+pull_tropism_row <- function(fit) {
+  cf <- summary(fit)$coefficients
+  if (!"TropismX4" %in% rownames(cf)) {
+    return(tibble(Estimate = NA_real_, CI_Lower = NA_real_, CI_Upper = NA_real_, P_value = NA_real_))
+  }
+  est <- cf["TropismX4", "Estimate"]
+  p   <- cf["TropismX4", "Pr(>|t|)"]
+  ci  <- suppressWarnings(stats::confint(fit, "TropismX4", level = 0.95))
+  tibble(Estimate = est, CI_Lower = ci[1], CI_Upper = ci[2], P_value = p)
+}
+
+# ---- 5) FIT MODELS: outcome × confounder-set ----
+model_results <- purrr::map_dfr(outcomes, function(outcome) {
+
+  # outcome filter: numeric, >0 only, then log2
+  df_y <- df0 %>%
+    mutate(.y_raw = to_num(.data[[outcome]])) %>%
+    mutate(.y_raw = ifelse(.y_raw > 0, .y_raw, NA_real_)) %>%
+    filter(!is.na(.y_raw)) %>%
+    mutate(log_y = log2(.y_raw))
+
+  # N used for outcome (post >0 + non-NA), BEFORE covariate complete-case
+  n_used <- df_y %>%
+    count(Tropism) %>%
+    pivot_wider(names_from = Tropism, values_from = n, values_fill = 0)
+
+  N_R5_used    <- n_used[["R5"]]
+  N_X4_used    <- n_used[["X4"]]
+  N_total_used <- N_R5_used + N_X4_used
+
+  purrr::imap_dfr(confounder_sets, function(covs, set_name) {
+
+    covs <- intersect(covs, names(df_y))
+
+    # clean covariates: remove blanks/whitespace, coerce numeric where needed
+    df1 <- df_y
+    for (cv in covs) {
+      df1 <- clean_covariate(df1, cv)
+    }
+
+    # complete-case for the model (this WILL drop NA + blanks we turned into NA)
+    df1 <- df1 %>%
+      filter(if (length(covs)) if_all(all_of(covs), ~ !is.na(.)) else TRUE)
+
+    # N actually used in model (after complete-case)
+    n_model <- df1 %>%
+      count(Tropism) %>%
+      pivot_wider(names_from = Tropism, values_from = n, values_fill = 0)
+
+    N_model_R5    <- n_model[["R5"]]
+    N_model_X4    <- n_model[["X4"]]
+    N_model_total <- N_model_R5 + N_model_X4
+
+    # bail if too small / single group
+    if (N_model_total < 10 || n_distinct(df1$Tropism) < 2) {
+      return(tibble(
+        Subset = "FULL",
+        Variable = outcome,
+        Confounder_Set = set_name,
+        Covariates = if (length(covs)) paste(covs, collapse = ", ") else "none",
+        Estimate = NA_real_, CI_Lower = NA_real_, CI_Upper = NA_real_, P_value = NA_real_,
+        N_total_used = N_total_used,
+        N_model_total = N_model_total, N_model_R5 = N_model_R5, N_model_X4 = N_model_X4
+      ))
+    }
+
+    fml <- if (length(covs)) {
+      as.formula(paste0("log_y ~ Tropism + ", paste(covs, collapse = " + ")))
+    } else {
+      as.formula("log_y ~ Tropism")
+    }
+
+    fit <- lm(fml, data = df1)
+
+    pull_tropism_row(fit) %>%
+      mutate(
+        Subset = "FULL",
+        Variable = outcome,
+        Confounder_Set = set_name,
+        Covariates = if (length(covs)) paste(covs, collapse = ", ") else "none",
+        N_total_used = N_total_used,
+        N_model_total = N_model_total, N_model_R5 = N_model_R5, N_model_X4 = N_model_X4
+      ) %>%
+      select(Subset, Variable, Confounder_Set, Covariates,
+             Estimate, CI_Lower, CI_Upper, P_value,
+             N_total_used, N_model_total, N_model_R5, N_model_X4)
+  })
+})
+
+
+# attach overall pre-filter counts (same for all rows)
+model_results <- model_results %>%
+  mutate(
+    N_R5_overall  = tropism_counts_overall$R5,
+    N_X4_overall  = tropism_counts_overall$X4,
+    N_total_overall = tropism_counts_overall$N_total,
+    Pct_R5_overall = tropism_counts_overall$Pct_R5,
+    Pct_X4_overall = tropism_counts_overall$Pct_X4
+  )
+
+# ---- 6) MEDIANS/IQR (raw scale) in FULL cohort, per outcome & tropism ----
+median_tbl <- purrr::map_dfr(outcomes, function(outcome) {
+  df0 %>%
+    mutate(.y = to_num(.data[[outcome]])) %>%
+    filter(!is.na(.y)) %>%
+    group_by(Tropism) %>%
+    summarise(
+      N      = n(),
+      Median = median(.y, na.rm = TRUE),
+      Q1     = quantile(.y, 0.25, na.rm = TRUE, type = 2),
+      Q3     = quantile(.y, 0.75, na.rm = TRUE, type = 2),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      IQR = Q3 - Q1,
+      Subset = "FULL",
+      Variable = outcome
+    ) %>%
+    select(Subset, Variable, Tropism, N, Median, Q1, Q3, IQR)
+})
+
+median_wide <- median_tbl %>%
+  pivot_wider(
+    names_from  = Tropism,
+    values_from = c(N, Median, Q1, Q3, IQR),
+    names_sep   = "_"
+  ) %>%
+  relocate(Subset, Variable)
+
+# ---- 7) SAVE TO EXCEL ----
+wb <- createWorkbook()
+addWorksheet(wb, "Models_log2_X4vsR5")
+writeData(wb, "Models_log2_X4vsR5", model_results)
+
+addWorksheet(wb, "Medians_IQR_long")
+writeData(wb, "Medians_IQR_long", median_tbl)
+
+addWorksheet(wb, "Medians_IQR_wide")
+writeData(wb, "Medians_IQR_wide", median_wide)
+
+saveWorkbook(wb, "Reservoir_FULL_confounder_sets_log2.xlsx", overwrite = TRUE)
+
+# ---- 8) QUICK VIEW ----
+model_results %>%
+  arrange(Variable, match(Confounder_Set, names(confounder_sets))) %>%
+  print(n = 200)
+
+# ============================================================
+# FOREST PLOT — FULL cohort, all confounder sets (ALL BLACK)
+# ============================================================
+
+library(ggplot2)
+
+plot_df <- model_results %>%
+  mutate(
+    Confounder_Set = factor(
+      Confounder_Set,
+      levels = rev(names(confounder_sets))  # reverse so NONE appears on top
+    ),
+    Variable = factor(Variable, levels = outcomes)
+  )
+
+p <- ggplot(plot_df,
+            aes(x = Estimate,
+                y = Confounder_Set)) +
+  geom_vline(xintercept = 0,
+             linetype = "dashed",
+             color = "black") +
+  geom_errorbarh(aes(xmin = CI_Lower,
+                     xmax = CI_Upper),
+                 height = 0.2,
+                 size = 0.8,
+                 color = "black") +
+  geom_point(size = 3,
+             color = "black") +
+  facet_wrap(~ Variable, ncol = 1) +
+  labs(
+    x = expression("β (log"[2]*" difference X4 vs R5)"),
+    y = "Confounder Set",
+    title = "Reservoir Analysis — FULL Cohort\nX4 vs R5 across different confounder sets"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(face = "bold"),
+    axis.text  = element_text(color = "black"),
+    axis.title = element_text(color = "black"),
+    plot.title = element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+print(p)
+
+ggsave("Forest_FULL_confounder_sets_log2.pdf",
+       p,
+       width = 8,
+       height = 6)
+```
+
+
+#TimetoART pre and post 2015
+```{r}
+# ============================================================
+# Time-to-ART comparison: R5 vs X4
+# Primary test : Wilcoxon rank-sum (raw days)            -> median (IQR)
+# Sensitivity  : Welch t-test on log2(days + 1)          -> parametric check
+# Outputs: counts + median/IQR + both tests + plots + distribution check + Excel
+# ============================================================
+
+# ============================================================
+# FUNCTION: DxEra (<2015 vs >=2015) time-to-ART comparison
+# ============================================================
+run_dxera_time_to_art <- function(dat,
+                                  dataset_name = "FULL",
+                                  era_cutoff = 2015,
+                                  era_order  = c("Pre2015", "Post2014"),
+                                  tx_order   = c("R5", "X4"),
+                                  time_var   = "TIMETOCART",
+                                  year_var   = "HIV_DATE",
+                                  out_prefix = "DxEra_TimeToART_R5vsX4") {
+
+  df_era <- dat %>%
+    filter(Tropism %in% tx_order) %>%
+    mutate(
+      Tropism = factor(Tropism, levels = tx_order),
+
+      DxEra = dplyr::case_when(
+        !is.na(.data[[year_var]]) & .data[[year_var]] <  era_cutoff ~ "Pre2015",
+        !is.na(.data[[year_var]]) & .data[[year_var]] >= era_cutoff ~ "Post2014",
+        TRUE ~ NA_character_
+      ),
+      DxEra = factor(DxEra, levels = era_order),
+
+      TIMEVAR = suppressWarnings(as.numeric(.data[[time_var]]))
+    ) %>%
+    filter(
+      !is.na(DxEra),
+      !is.na(TIMEVAR),
+      is.finite(TIMEVAR),
+      TIMEVAR >= 0
+    )
+
+  era_counts <- df_era %>%
+    count(DxEra, Tropism, name = "n") %>%
+    arrange(DxEra, Tropism)
+
+  era_summary <- df_era %>%
+    group_by(DxEra, Tropism) %>%
+    summarise(
+      n = n(),
+      Median = median(TIMEVAR, na.rm = TRUE),
+      Q1 = quantile(TIMEVAR, 0.25, na.rm = TRUE),
+      Q3 = quantile(TIMEVAR, 0.75, na.rm = TRUE),
+      # geometric-mean time (back-transformed log2 mean) for the parametric side
+      GeoMean_days = 2^(mean(log2(TIMEVAR + 1), na.rm = TRUE)) - 1,
+      .groups = "drop"
+    ) %>%
+    mutate(
+      Median_IQR = paste0(
+        round(Median, 1), " (",
+        round(Q1, 1), " - ",
+        round(Q3, 1), ")"
+      )
+    )
+
+  # -------------------------
+  # TESTS: Wilcoxon (raw, primary) + Welch t-test on log2(x+1) (sensitivity)
+  # -------------------------
+  era_tests <- df_era %>%
+    group_by(DxEra) %>%
+    summarise(
+      wilcox_p = {
+        x <- TIMEVAR[Tropism == "R5"]
+        y <- TIMEVAR[Tropism == "X4"]
+        if (length(x) >= 5 && length(y) >= 5) {
+          wilcox.test(x, y, exact = FALSE)$p.value
+        } else NA_real_
+      },
+      t_log2_p = {
+        x <- TIMEVAR[Tropism == "R5"]
+        y <- TIMEVAR[Tropism == "X4"]
+        if (length(x) >= 5 && length(y) >= 5) {
+          t.test(log2(x + 1), log2(y + 1), var.equal = FALSE)$p.value
+        } else NA_real_
+      },
+      .groups = "drop"
+    ) %>%
+    mutate(
+      wilcox_p_BH = p.adjust(wilcox_p, method = "BH"),
+      t_log2_p_BH = p.adjust(t_log2_p, method = "BH"),
+      signif = case_when(
+        is.na(wilcox_p_BH) ~ "NA",
+        wilcox_p_BH < 0.001 ~ "***",
+        wilcox_p_BH < 0.01  ~ "**",
+        wilcox_p_BH < 0.05  ~ "*",
+        TRUE ~ "ns"
+      ),
+      p_label = ifelse(
+        is.na(wilcox_p_BH),
+        "Wilcoxon BH p=NA",
+        paste0(
+          "Wilcoxon BH p=", signif(wilcox_p_BH, 3), " (", signif, ")",
+          "\nt(log2) BH p=", ifelse(is.na(t_log2_p_BH), "NA", signif(t_log2_p_BH, 3))
+        )
+      )
+    )
+
+  # -------------------------
+  # PLOT (raw days)
+  # -------------------------
+  p_time_to_art <- ggplot(
+    df_era,
+    aes(x = Tropism, y = TIMEVAR, fill = Tropism)
+  ) +
+    geom_violin(trim = FALSE, alpha = 0.4) +
+    geom_jitter(aes(color = Tropism), width = 0.15, size = 0.5, alpha = 0.9) +
+    geom_boxplot(width = 0.2, outlier.shape = NA, alpha = 0.6, color = "black") +
+    facet_wrap(~ DxEra, nrow = 1, scales = "free_y") +
+    scale_x_discrete(limits = tx_order) +
+    scale_fill_manual(values = custom_colors) +
+    scale_color_manual(values = custom_colors) +
+    labs(
+      title = paste0("Time to ART by diagnosis era (R5 vs X4) - ", dataset_name),
+      x = "",
+      y = paste0(time_var, " (days)")
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+      axis.text.x = element_text(size = 13, color = "black"),
+      strip.text = element_text(face = "bold"),
+      legend.position = "none"
+    )
+
+  # n labels at y = 0
+  n_label_df <- era_counts %>%
+    mutate(y = 0, label = paste0("n=", n))
+
+  p_time_to_art <- p_time_to_art +
+    geom_text(
+      data = n_label_df,
+      aes(x = Tropism, y = y, label = label),
+      inherit.aes = FALSE, size = 4, vjust = 1.5
+    )
+
+  # p-value labels (Wilcoxon primary + t(log2) sensitivity)
+  ypos_df <- df_era %>%
+    group_by(DxEra) %>%
+    summarise(y_pos = max(TIMEVAR, na.rm = TRUE) * 1.08, .groups = "drop") %>%
+    left_join(era_tests, by = "DxEra") %>%
+    mutate(x = "R5")
+
+  p_time_to_art <- p_time_to_art +
+    geom_text(
+      data = ypos_df,
+      aes(x = x, y = y_pos, label = p_label),
+      inherit.aes = FALSE, hjust = 0, vjust = 1, size = 3.8
+    )
+
+  pdf_file  <- paste0(out_prefix, "_", dataset_name, ".pdf")
+
+  ggsave(pdf_file, p_time_to_art, width = 14, height = 6)
+
+  list(
+    df_era = df_era,
+    counts = era_counts,
+    summary = era_summary,
+    tests = era_tests,
+    plot = p_time_to_art,
+    pdf_file = pdf_file
+  )
+}
+
+
+# ============================================================
+# FUNCTION: INF_1y subset only - R5 vs X4 time-to-ART (no era split)
+# ============================================================
+run_inf1y_time_to_art_noera <- function(dat,
+                                        dataset_name = "INF_1y_NoEra",
+                                        tx_order = c("R5", "X4"),
+                                        time_var = "TIMETOCART",
+                                        out_prefix = "DxEra_TimeToART_R5vsX4") {
+
+  df <- dat %>%
+    filter(Tropism %in% tx_order) %>%
+    mutate(
+      Tropism = factor(Tropism, levels = tx_order),
+      TIMEVAR = suppressWarnings(as.numeric(.data[[time_var]]))
+    ) %>%
+    filter(!is.na(TIMEVAR), is.finite(TIMEVAR), TIMEVAR >= 0)
+
+  counts <- df %>%
+    count(Tropism, name = "n") %>%
+    mutate(label = paste0("n=", n))
+
+  summary_tbl <- df %>%
+    group_by(Tropism) %>%
+    summarise(
+      n = n(),
+      Median = median(TIMEVAR, na.rm = TRUE),
+      Q1 = quantile(TIMEVAR, 0.25, na.rm = TRUE),
+      Q3 = quantile(TIMEVAR, 0.75, na.rm = TRUE),
+      GeoMean_days = 2^(mean(log2(TIMEVAR + 1), na.rm = TRUE)) - 1,
+      .groups = "drop"
+    ) %>%
+    mutate(
+      Median_IQR = paste0(
+        round(Median, 1), " (",
+        round(Q1, 1), " - ",
+        round(Q3, 1), ")"
+      )
+    )
+
+  x <- df$TIMEVAR[df$Tropism == "R5"]
+  y <- df$TIMEVAR[df$Tropism == "X4"]
+
+  ok <- length(x) >= 5 && length(y) >= 5
+
+  wilcox_p <- if (ok) wilcox.test(x, y, exact = FALSE)$p.value else NA_real_
+  t_log2_p <- if (ok) t.test(log2(x + 1), log2(y + 1), var.equal = FALSE)$p.value else NA_real_
+
+  tests <- tibble::tibble(
+    Dataset = dataset_name,
+    wilcox_p = wilcox_p,
+    t_log2_p = t_log2_p,
+    p_label = paste0(
+      "Wilcoxon p=", ifelse(is.na(wilcox_p), "NA", signif(wilcox_p, 3)),
+      "\nt(log2) p=", ifelse(is.na(t_log2_p), "NA", signif(t_log2_p, 3))
+    )
+  )
+
+  p <- ggplot(df, aes(x = Tropism, y = TIMEVAR, fill = Tropism)) +
+    geom_violin(trim = FALSE, alpha = 0.4) +
+    geom_jitter(aes(color = Tropism), width = 0.15, size = 0.5, alpha = 0.9) +
+    geom_boxplot(width = 0.2, outlier.shape = NA, alpha = 0.6, color = "black") +
+    scale_x_discrete(limits = tx_order) +
+    scale_fill_manual(values = custom_colors) +
+    scale_color_manual(values = custom_colors) +
+    labs(
+      title = paste0("Time to ART (R5 vs X4) - ", dataset_name),
+      x = "",
+      y = paste0(time_var, " (days)")
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+      axis.text.x = element_text(size = 13, color = "black"),
+      legend.position = "none"
+    )
+
+  p <- p +
+    geom_text(
+      data = counts,
+      aes(x = Tropism, y = 0, label = label),
+      inherit.aes = FALSE, size = 4, vjust = 1.5
+    )
+
+  y_pos <- max(df$TIMEVAR, na.rm = TRUE) * 1.08
+
+  p <- p +
+    geom_text(
+      data = data.frame(x = "R5", y = y_pos, label = tests$p_label),
+      aes(x = x, y = y, label = label),
+      inherit.aes = FALSE, hjust = 0, vjust = 1, size = 3.8
+    )
+
+  pdf_file  <- paste0(out_prefix, "_", dataset_name, ".pdf")
+
+  ggsave(pdf_file, p, width = 8, height = 6)
+
+  list(
+    plot = p,
+    counts = counts,
+    summary = summary_tbl,
+    tests = tests,
+    pdf_file = pdf_file
+  )
+}
+
+
+# ============================================================
+# FUNCTION: DISTRIBUTION CHECK
+# Raw vs log2(x+1), density by Tropism, faceted by diagnosis era.
+# Shows why Wilcoxon (raw) is primary and the parametric test is on log2.
+# ============================================================
+plot_time_to_art_distribution <- function(dat,
+                                          dataset_name = "FULL",
+                                          era_cutoff = 2015,
+                                          era_order  = c("Pre2015", "Post2014"),
+                                          tx_order   = c("R5", "X4"),
+                                          time_var   = "TIMETOCART",
+                                          year_var   = "HIV_DATE",
+                                          out_prefix = "DxEra_TimeToART_R5vsX4") {
+
+  df_era <- dat %>%
+    filter(Tropism %in% tx_order) %>%
+    mutate(
+      Tropism = factor(Tropism, levels = tx_order),
+      DxEra = dplyr::case_when(
+        !is.na(.data[[year_var]]) & .data[[year_var]] <  era_cutoff ~ "Pre2015",
+        !is.na(.data[[year_var]]) & .data[[year_var]] >= era_cutoff ~ "Post2014",
+        TRUE ~ NA_character_
+      ),
+      DxEra = factor(DxEra, levels = era_order),
+      TIMEVAR = suppressWarnings(as.numeric(.data[[time_var]]))
+    ) %>%
+    filter(!is.na(DxEra), !is.na(TIMEVAR), is.finite(TIMEVAR), TIMEVAR >= 0)
+
+  if (nrow(df_era) == 0) return(NULL)
+
+  dist_long <- bind_rows(
+    df_era %>% transmute(Tropism, DxEra, Scale = "Raw (days)", Value = TIMEVAR),
+    df_era %>% transmute(Tropism, DxEra, Scale = "log2(x+1)",  Value = log2(TIMEVAR + 1))
+  ) %>%
+    mutate(Scale = factor(Scale, levels = c("Raw (days)", "log2(x+1)")))
+
+  # Independent axes for every era x scale panel (Raw and log2 must NOT share an axis,
+  # and Pre/Post eras must not share one either). facet_wrap + scales="free" does this;
+  # facet_grid would force a common x within each column and y within each row.
+  panel_levels <- unlist(lapply(
+    era_order,
+    function(e) paste0(e, "\n", c("Raw (days)", "log2(x+1)"))
+  ))
+  dist_long <- dist_long %>%
+    mutate(Panel = factor(paste0(DxEra, "\n", Scale), levels = panel_levels))
+
+  p_dist <- ggplot(dist_long, aes(x = Value, fill = Tropism, color = Tropism)) +
+    geom_density(alpha = 0.35, linewidth = 0.4) +
+    facet_wrap(~ Panel, scales = "free", ncol = 2) +
+    scale_fill_manual(values = custom_colors) +
+    scale_color_manual(values = custom_colors) +
+    labs(
+      title = paste0("Time-to-ART distribution (R5 vs X4) - ", dataset_name),
+      subtitle = "Raw is right-skewed (Wilcoxon, primary); log2(x+1) used for the parametric sensitivity test",
+      x = "Time to ART", y = "Density"
+    ) +
+    theme_bw(base_size = 13) +
+    theme(strip.text = element_text(face = "bold"))
+
+  pdf_file <- paste0(out_prefix, "_", dataset_name, "_DistributionCheck.pdf")
+  ggsave(pdf_file, p_dist, width = 11, height = 7)
+
+  list(plot = p_dist, data = dist_long, pdf_file = pdf_file)
+}
+
+
+# ============================================================
+# RUN ANALYSES
+# ============================================================
+
+# --- Subsets ---
+data_INF_1y <- data %>%
+  filter(INF_date_known_1y == 1)
+
+# --- Distribution checks FIRST (justify test choice) ---
+dist_full  <- plot_time_to_art_distribution(data,        dataset_name = "FULL")
+dist_inf1y <- plot_time_to_art_distribution(data_INF_1y, dataset_name = "INF_1y")
+
+# --- Comparisons: Wilcoxon (primary) + Welch t on log2 (sensitivity) ---
+res_full <- run_dxera_time_to_art(
+  dat = data,
+  dataset_name = "FULL"
+)
+
+res_inf1y <- run_dxera_time_to_art(
+  dat = data_INF_1y,
+  dataset_name = "INF_1y"
+)
+
+res_inf1y_noera <- run_inf1y_time_to_art_noera(
+  dat = data_INF_1y,
+  dataset_name = "INF_1y_NoEra"
+)
+
+# --- Show plots ---
+dist_full$plot
+dist_inf1y$plot
+res_full$plot
+res_inf1y$plot
+res_inf1y_noera$plot
+
+# ============================================================
+# SINGLE CONSOLIDATED EXCEL
+# One workbook; one sheet per table, stacked across analyses
+# and tagged by an Analysis column.
+# ============================================================
+tag <- function(df, analysis) dplyr::mutate(df, Analysis = analysis, .before = 1)
+
+writexl::write_xlsx(
+  list(
+    Summary = dplyr::bind_rows(
+      tag(res_full$summary,        "FULL_era"),
+      tag(res_inf1y$summary,       "INF_1y_era"),
+      tag(res_inf1y_noera$summary, "INF_1y_noera")
+    ),
+    Counts = dplyr::bind_rows(
+      tag(res_full$counts,        "FULL_era"),
+      tag(res_inf1y$counts,       "INF_1y_era"),
+      tag(res_inf1y_noera$counts, "INF_1y_noera")
+    ),
+    Tests = dplyr::bind_rows(
+      tag(res_full$tests,        "FULL_era"),
+      tag(res_inf1y$tests,       "INF_1y_era"),
+      tag(res_inf1y_noera$tests, "INF_1y_noera")
+    )
+  ),
+  "DxEra_TimeToART_R5vsX4_AllResults.xlsx"
+)
+```
