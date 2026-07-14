@@ -1,0 +1,1761 @@
+---
+title: "2000HIV_flow_Tropism_KM_Percentage"
+author: "Kavita Mehta"
+date: "2025-02-28"
+output: html_document
+---
+
+# Load Required Libraries
+```{r}
+library(dplyr)
+library(tidyr)
+library(lmtest)
+library(sandwich)
+library(openxlsx)
+library(car)
+library(qvalue)
+library(ggplot2)
+library(ggrepel)
+library(readxl)
+library(stringr)
+library(pheatmap)
+```
+
+# Load Data Files
+```{r}
+flow_data <- read.xlsx("R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_Flow/2000HIV_FLOW_PER_panel123merged_QCed_untransformed(raw)data_1434samples_356vars_Nov062023.xlsx") %>% as.data.frame()
+pca_data <- read.xlsx("R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_VROLINK2/2000HIV_preimputed_GRCh38_2000HIV_all_ethnicities_clean_final_complete_cohort_wo_outliers.pca.xlsx") %>% as.data.frame()
+clinical_data <- read.xlsx("R:/hcrc/Personal folders/Kavita Mehta/2000HIV/clinical data/KAVITA_IMPUT_DATAFRAME_SMOKING_CURRENT_RESOLVED.xlsx") 
+```
+
+#Flow Marker processing (trimming names)
+```{r}
+# Store Original Full Column Names Before Trimming
+original_flow_names <- colnames(flow_data)
+
+# Trim Flow Marker Names for Processing
+trim_marker_name <- function(marker) {
+  parts <- unlist(strsplit(marker, "_"))  # Split by "_"
+  if (length(parts) >= 2) {
+    return(paste(parts[1:2], collapse = "_"))  # Keep only the first two parts
+  } else {
+    return(marker)  # Return original if no second underscore
+  }
+}
+
+# Create a Mapping of Trimmed to Full Names
+trimmed_flow_names <- sapply(original_flow_names, trim_marker_name)
+name_mapping <- data.frame(Full_Name = original_flow_names, Trimmed_Name = trimmed_flow_names, stringsAsFactors = FALSE)
+
+# Apply Trimmed Names to Flow Data
+colnames(flow_data) <- trimmed_flow_names
+
+```
+
+#Merging dataset, seasonality and filtering 
+```{r}
+# Merge Data
+merged_data <- flow_data %>%
+  left_join(clinical_data, by = "ID") %>%
+  left_join(pca_data, by = "ID") 
+
+# Compute Seasonal Variables
+merged_data <- merged_data %>%
+  mutate(
+    dayssincejan2019 = as.numeric(as.POSIXct(DATE_VISIT, format="%Y-%m-%d") - as.POSIXct("2019-01-01")),
+    season_sin = sin((2 * pi * dayssincejan2019) / 365.2425),
+    season_cos = cos((2 * pi * dayssincejan2019) / 365.2425),
+    SEX_BIRTH = as.factor(SEX_BIRTH),
+    ETHNICITY = as.factor(ETHNICITY),
+    CENTER_RUMC = as.integer(CENTER == "RUMC")
+  )
+
+
+# ================================
+# Ethnicity and Center Dummies
+# ================================
+merged_data <- merged_data %>%
+  mutate(
+    ASIAN    = as.numeric(ETHNICITY == "Asian"),
+    BLACK    = as.numeric(ETHNICITY == "Black"),
+    WHITE    = as.numeric(ETHNICITY == "White"),
+    CENTER_RUMC = as.numeric(CENTER == "RUMC")
+  )
+
+# Filter Out "EC_persistent" from CONTROLLER_1B
+merged_data <- merged_data %>%
+  filter(Tropism %in% c("X4", "R5")) %>%
+ filter(CONTROLLER_1B != "EC_persistent")
+
+
+
+merged_data$Tropism <- factor(merged_data$Tropism, levels = c("R5", "X4"))
+
+
+# Define Covariates
+covariate_columns <- c("AGE", "SEX_BIRTH", "TIMETOLAB", "season_sin", "season_cos", "CENTER_RUMC", "CD4_NADIR", "COVID_VACC")
+
+# Remove Rows with Missing Covariates
+merged_data <- merged_data %>% drop_na(all_of(covariate_columns))
+```
+
+
+
+#Cohort subset
+```{r}
+merged_data_complete <- merged_data
+merged_data_validation <- subset(merged_data_complete, COHORT == "VALIDATION")
+merged_data_discovery <- subset(merged_data_complete, COHORT == "DISCOVERY")
+```
+
+
+#PCA
+```{r}
+# ================================
+# PCA on FLOW cytometry data
+# Before and after covariate correction
+# Heatmap = adjusted R2
+# ================================
+
+suppressPackageStartupMessages({
+  library(openxlsx)
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(FactoMineR)
+  library(factoextra)
+  library(pheatmap)
+  library(corrplot)
+})
+
+out_dir <- "R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_Flow/Percentage/PCA_assumption_checks"
+
+if (!dir.exists(out_dir)) {
+  dir.create(out_dir, recursive = TRUE)
+}
+
+# ================================
+# Dataset
+# ================================
+
+pca_df <- merged_data_discovery
+
+pca_df[pca_df == -Inf] <- NA
+pca_df[pca_df == Inf]  <- NA
+
+# ================================
+# Define flow marker columns
+# ================================
+
+start_marker <- "Panel1_1012"
+end_marker   <- "Panel3_3116"
+
+start_index <- which(colnames(pca_df) == start_marker)
+end_index   <- which(colnames(pca_df) == end_marker)
+
+if (length(start_index) == 0 || length(end_index) == 0) {
+  stop("Could not find start_marker or end_marker in pca_df.")
+}
+
+flow_columns <- colnames(pca_df)[start_index:end_index]
+
+selected_columns <- pca_df[, flow_columns, drop = FALSE] %>%
+  mutate(across(everything(), as.numeric))
+
+selected_columns <- selected_columns[, colSums(!is.na(selected_columns)) > 0, drop = FALSE]
+selected_columns <- selected_columns[,
+  apply(selected_columns, 2, function(x) sd(x, na.rm = TRUE) > 0),
+  drop = FALSE
+]
+
+complete_rows        <- complete.cases(selected_columns)
+selected_columns_pca <- selected_columns[complete_rows, , drop = FALSE]
+pca_meta             <- pca_df[complete_rows, , drop = FALSE]
+
+# ================================
+# Covariates for heatmap
+# ================================
+
+required_cols <- c(
+  "ID", "AGE", "SEX_BIRTH", "BMI_BASELINE", "SMOKING_CURRENT", "CENTER",
+  "season_sin", "season_cos", "CENTER_RUMC", "ASIAN", "BLACK",
+  "HISPANIC", "MIXED", "WHITE", "PANDEMIC_BEFOREAFTER", "COVID19", "COVID_VACC",
+  "TIMETOLAB", "MUTHIV", "CD4_NADIR", "CD4CD8_PRECART", "VL_ZENITH", "VL_preCART",
+  "HEPC", "HEPA_BASELINE", "HEPB_BASELINE", "CART_DURATION", "HIV_STAGE_CDC",
+  "EARLY_CART", "HIV_DURATION", paste0("PC", 1:5)
+)
+
+missing_cols <- setdiff(required_cols, colnames(pca_meta))
+if (length(missing_cols) > 0) {
+  message("Missing columns not used: ", paste(missing_cols, collapse = ", "))
+}
+
+required_cols_present <- required_cols[required_cols %in% colnames(pca_meta)]
+heatmap_cols          <- required_cols_present[required_cols_present != "ID"]
+
+# ================================
+# Custom scree plot function
+# ================================
+
+plot_scree_custom <- function(pca_obj, title, n_dims = 25, pc_cutoff = 5) {
+
+  n_dims  <- min(n_dims, nrow(pca_obj$eig))
+  eig_vals <- pca_obj$eig[1:n_dims, ]
+  dims     <- 1:n_dims
+  pct      <- eig_vals[, 2]
+  cum_pct  <- eig_vals[, 3]
+
+  cutoff_cum <- cum_pct[pc_cutoff]
+
+  df <- data.frame(
+    Dimension  = dims,
+    Variance   = pct,
+    Cumulative = cum_pct
+  )
+
+  ggplot(df, aes(x = Dimension)) +
+    geom_bar(aes(y = Variance), stat = "identity",
+             fill = "steelblue3", alpha = 0.8) +
+    geom_line(aes(y = Variance), color = "black", linewidth = 0.6) +
+    geom_point(aes(y = Variance), color = "black", size = 2) +
+    geom_line(aes(y = Cumulative), color = "grey50", linewidth = 0.8) +
+    geom_point(aes(y = Cumulative), color = "grey50", size = 2) +
+    geom_vline(xintercept = pc_cutoff, linetype = "dashed",
+               color = "black", linewidth = 0.6) +
+    geom_hline(yintercept = cutoff_cum, linetype = "dotted",
+               color = "grey30", linewidth = 0.5) +
+    annotate("text",
+             x     = pc_cutoff + 0.5,
+             y     = max(pct) * 0.95,
+             label = paste0("PC", pc_cutoff, "\n(cum. ", round(cutoff_cum, 1), "%)"),
+             hjust = 0, size = 3.5, color = "black") +
+    geom_text(aes(y = Variance,
+                  label = paste0(round(Variance, 1), "%")),
+              vjust = -0.5, size = 3, color = "black") +
+    scale_x_continuous(breaks = dims) +
+    scale_y_continuous(
+      name     = "Percentage of explained variance",
+      sec.axis = sec_axis(~ ., name = "Cumulative variance (%)")
+    ) +
+    labs(title = title, x = "Dimensions") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.text.x  = element_text(size = 9),
+      axis.title.y = element_text(size = 11),
+      plot.title   = element_text(face = "bold")
+    )
+}
+
+# ================================
+# PCA regression heatmap function
+# ================================
+
+plot_PCA_regression <- function(pca, meta_data, meta_variables,
+                                title = "PC contribution") {
+
+  pca_res <- as.data.frame(pca$ind$coord[, 1:5, drop = FALSE])
+  colnames(pca_res) <- paste0("Flow_PC", 1:ncol(pca_res))
+
+  meta_variables_present <- meta_variables[meta_variables %in% colnames(meta_data)]
+
+  pca_adj_r_sq <- matrix(
+    NA_real_,
+    nrow = length(meta_variables_present),
+    ncol = ncol(pca_res)
+  )
+  rownames(pca_adj_r_sq) <- meta_variables_present
+  colnames(pca_adj_r_sq) <- colnames(pca_res)
+
+  for (i in seq_len(ncol(pca_res))) {
+    for (j in seq_along(meta_variables_present)) {
+
+      var_name <- meta_variables_present[j]
+
+      tmp <- data.frame(
+        pc_value = as.numeric(pca_res[[i]]),
+        covar    = meta_data[[var_name]]
+      )
+      tmp <- tmp[complete.cases(tmp), , drop = FALSE]
+
+      if (nrow(tmp) < 10 || length(unique(tmp$covar)) < 2) {
+        pca_adj_r_sq[j, i] <- NA_real_
+        next
+      }
+
+      if (is.character(tmp$covar) || is.factor(tmp$covar)) {
+        tmp$covar <- as.factor(tmp$covar)
+      } else {
+        tmp$covar <- suppressWarnings(as.numeric(tmp$covar))
+      }
+
+      tmp <- tmp[complete.cases(tmp), , drop = FALSE]
+
+      if (nrow(tmp) < 10 || length(unique(tmp$covar)) < 2) {
+        pca_adj_r_sq[j, i] <- NA_real_
+        next
+      }
+
+      fit <- tryCatch(
+        lm(pc_value ~ covar, data = tmp),
+        error = function(e) NULL
+      )
+
+      if (!is.null(fit)) {
+        pca_adj_r_sq[j, i] <- as.numeric(summary(fit)$adj.r.squared)
+      }
+    }
+  }
+
+  storage.mode(pca_adj_r_sq) <- "numeric"
+
+  pheatmap::pheatmap(
+    pca_adj_r_sq,
+    cluster_rows    = FALSE,
+    cluster_cols    = FALSE,
+    show_rownames   = TRUE,
+    show_colnames   = TRUE,
+    scale           = "none",
+    main            = title,
+    display_numbers = TRUE,
+    number_format   = "%.2f",
+    fontsize        = 12,
+    fontsize_number = 10,
+    color  = colorRampPalette(c("blue", "white", "red"))(50),
+    breaks = seq(-0.5, 0.5, length.out = 51)
+  )
+}
+
+# ================================
+# PCA before correction
+# ================================
+
+mypca_flow <- PCA(selected_columns_pca, ncp = 10, graph = FALSE)
+
+# Scree plot before correction
+pca_scree_plot <- plot_scree_custom(
+  mypca_flow,
+  title     = "Scree plot: Flow PCA before correction",
+  n_dims    = 25,
+  pc_cutoff = 5
+)
+
+ggsave(
+  file.path(out_dir, "Flow_PCA_Scree_Plot_before_correction.pdf"),
+  plot = pca_scree_plot, width = 12, height = 6
+)
+ggsave(
+  file.path(out_dir, "Flow_PCA_Scree_Plot_before_correction.tiff"),
+  plot = pca_scree_plot, width = 12, height = 6,
+  dpi = 600, units = "in", device = "tiff"
+)
+
+# PCA scatter plot before correction
+pca_before_df    <- as.data.frame(mypca_flow$ind$coord)
+pca_before_df$ID <- pca_meta$ID
+group_var        <- "Tropism"
+
+pca_before_df$Group <- if (group_var %in% colnames(pca_meta)) {
+  as.factor(pca_meta[[group_var]])
+} else {
+  "All samples"
+}
+
+var_pc1 <- round(mypca_flow$eig[1, 2], 1)
+var_pc2 <- round(mypca_flow$eig[2, 2], 1)
+
+pca_before_plot <- ggplot(
+  pca_before_df, aes(x = Dim.1, y = Dim.2, color = Group)
+) +
+  geom_point(size = 2.2, alpha = 0.8) +
+  theme_classic(base_size = 14) +
+  labs(
+    title = "Flow PCA before correction",
+    x     = paste0("Flow PC1 (", var_pc1, "%)"),
+    y     = paste0("Flow PC2 (", var_pc2, "%)"),
+    color = group_var
+  )
+
+ggsave(
+  file.path(out_dir, "Flow_PCA_before_correction.pdf"),
+  plot = pca_before_plot, width = 7, height = 6
+)
+ggsave(
+  file.path(out_dir, "Flow_PCA_before_correction.tiff"),
+  plot = pca_before_plot, width = 7, height = 6,
+  dpi = 600, units = "in", device = "tiff"
+)
+
+# Heatmap before correction
+pdf(file.path(out_dir, "Flow_PCA_Regression_Heatmap_before_correction.pdf"),
+    width = 10, height = 12)
+plot_PCA_regression(mypca_flow, pca_meta, heatmap_cols,
+                    title = "Flow PCA regression heatmap before correction")
+dev.off()
+
+tiff(file.path(out_dir, "Flow_PCA_Regression_Heatmap_before_correction.tiff"),
+     width = 10, height = 12, units = "in", res = 600)
+plot_PCA_regression(mypca_flow, pca_meta, heatmap_cols,
+                    title = "Flow PCA regression heatmap before correction")
+dev.off()
+
+# ================================
+# Correlation matrix of covariates
+# ================================
+
+meta_data_cor <- pca_meta %>%
+  dplyr::select(all_of(heatmap_cols)) %>%
+  mutate(across(everything(), ~ as.numeric(as.factor(.))))
+
+cor_matrix <- cor(meta_data_cor, use = "pairwise.complete.obs")
+
+pdf(file.path(out_dir, "Flow_Correlation_Matrix_Covariates.pdf"),
+    width = 12, height = 10)
+corrplot(
+  cor_matrix,
+  method      = "color",
+  type        = "upper",
+  tl.col      = "black",
+  tl.srt      = 50,
+  tl.cex      = 0.6,
+  addCoef.col = "black",
+  number.cex  = 0.4,
+  col         = colorRampPalette(c("blue", "white", "red"))(200)
+)
+dev.off()
+
+# ================================
+# Residualized flow matrix after correction
+# ================================
+
+covariates_for_correction <- c(
+  "AGE", "SEX_BIRTH", "TIMETOLAB",
+  "season_sin", "season_cos",
+  "CENTER_RUMC", "COVID_VACC"
+)
+
+covariates_for_correction <- covariates_for_correction[
+  covariates_for_correction %in% colnames(pca_meta)
+]
+
+residual_matrix <- matrix(
+  NA_real_,
+  nrow = nrow(pca_meta),
+  ncol = ncol(selected_columns_pca)
+)
+colnames(residual_matrix) <- colnames(selected_columns_pca)
+rownames(residual_matrix) <- pca_meta$ID
+
+for (marker_col in colnames(selected_columns_pca)) {
+
+  model_df <- data.frame(
+    row_id = seq_len(nrow(pca_meta)),
+    marker = selected_columns_pca[[marker_col]],
+    pca_meta[, covariates_for_correction, drop = FALSE]
+  )
+  model_df <- model_df[complete.cases(model_df), , drop = FALSE]
+
+  if (nrow(model_df) < 10 || sd(model_df$marker, na.rm = TRUE) == 0) next
+
+  fit <- tryCatch(
+    lm(
+      as.formula(paste("marker ~",
+                       paste(covariates_for_correction, collapse = " + "))),
+      data = model_df
+    ),
+    error = function(e) NULL
+  )
+
+  if (!is.null(fit)) {
+    residual_matrix[model_df$row_id, marker_col] <- residuals(fit)
+  }
+}
+
+residuals_df <- as.data.frame(residual_matrix)
+residuals_df <- residuals_df[, colSums(!is.na(residuals_df)) > 0, drop = FALSE]
+residuals_df <- residuals_df[,
+  apply(residuals_df, 2, function(x) sd(x, na.rm = TRUE) > 0),
+  drop = FALSE
+]
+
+complete_rows_res <- complete.cases(residuals_df)
+residuals_pca     <- residuals_df[complete_rows_res, , drop = FALSE]
+pca_meta_res      <- pca_meta[complete_rows_res, , drop = FALSE]
+
+mypcares_flow <- PCA(residuals_pca, ncp = 10, graph = FALSE)
+
+# Scree plot after correction
+pca_scree_plot_after <- plot_scree_custom(
+  mypcares_flow,
+  title     = "Scree plot: Flow PCA after correction",
+  n_dims    = 25,
+  pc_cutoff = 5
+)
+
+ggsave(
+  file.path(out_dir, "Flow_PCA_Scree_Plot_after_correction.pdf"),
+  plot = pca_scree_plot_after, width = 12, height = 6
+)
+ggsave(
+  file.path(out_dir, "Flow_PCA_Scree_Plot_after_correction.tiff"),
+  plot = pca_scree_plot_after, width = 12, height = 6,
+  dpi = 600, units = "in", device = "tiff"
+)
+
+# PCA scatter plot after correction
+pca_after_df    <- as.data.frame(mypcares_flow$ind$coord)
+pca_after_df$ID <- pca_meta_res$ID
+
+pca_after_df$Group <- if (group_var %in% colnames(pca_meta_res)) {
+  as.factor(pca_meta_res[[group_var]])
+} else {
+  "All samples"
+}
+
+var_pc1_after <- round(mypcares_flow$eig[1, 2], 1)
+var_pc2_after <- round(mypcares_flow$eig[2, 2], 1)
+
+pca_after_plot <- ggplot(
+  pca_after_df, aes(x = Dim.1, y = Dim.2, color = Group)
+) +
+  geom_point(size = 2.2, alpha = 0.8) +
+  theme_classic(base_size = 14) +
+  labs(
+    title = "Flow PCA after correction",
+    x     = paste0("Flow PC1 (", var_pc1_after, "%)"),
+    y     = paste0("Flow PC2 (", var_pc2_after, "%)"),
+    color = group_var
+  )
+
+ggsave(
+  file.path(out_dir, "Flow_PCA_after_correction.pdf"),
+  plot = pca_after_plot, width = 7, height = 6
+)
+ggsave(
+  file.path(out_dir, "Flow_PCA_after_correction.tiff"),
+  plot = pca_after_plot, width = 7, height = 6,
+  dpi = 600, units = "in", device = "tiff"
+)
+
+# Heatmap after correction
+heatmap_cols_res <- heatmap_cols[heatmap_cols %in% colnames(pca_meta_res)]
+
+pdf(file.path(out_dir, "Flow_PCA_Regression_Heatmap_after_correction.pdf"),
+    width = 10, height = 12)
+plot_PCA_regression(mypcares_flow, pca_meta_res, heatmap_cols_res,
+                    title = "Flow PCA regression heatmap after correction")
+dev.off()
+
+tiff(file.path(out_dir, "Flow_PCA_Regression_Heatmap_after_correction.tiff"),
+     width = 10, height = 12, units = "in", res = 600)
+plot_PCA_regression(mypcares_flow, pca_meta_res, heatmap_cols_res,
+                    title = "Flow PCA regression heatmap after correction")
+dev.off()
+```
+
+
+#ASSUMPTION CHECK
+```{r}
+# ================================
+# FLOW PCA regression assumption checks
+# Reviewer response:
+# Normality, homoscedasticity, and linearity
+#
+# Models: Flow PC score ~ covariate
+#
+# Outputs:
+# 1) Q-Q plots: normality
+# 2) Residuals vs fitted: homoscedasticity
+# 3) Residuals vs fitted for continuous covariates only: linearity
+#    with natural cubic spline smoother, not LOESS
+# ================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(FactoMineR)
+  library(lmtest)
+  library(splines)
+  library(openxlsx)
+  library(ggplot2)
+})
+
+out_dir <- "R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_Flow/Percentage/PCA_assumption_checks"
+
+if (!dir.exists(out_dir)) {
+  dir.create(out_dir, recursive = TRUE)
+}
+
+# ================================
+# If PCA objects are not already available, recreate them
+# ================================
+
+if (!exists("selected_columns_pca") || !exists("pca_meta")) {
+  
+  pca_df <- merged_data_discovery
+  
+  pca_df[pca_df == -Inf] <- NA
+  pca_df[pca_df == Inf]  <- NA
+  
+  start_marker <- "Panel1_1012"
+  end_marker   <- "Panel3_3116"
+  
+  start_index <- which(colnames(pca_df) == start_marker)
+  end_index   <- which(colnames(pca_df) == end_marker)
+  
+  if (length(start_index) == 0 || length(end_index) == 0) {
+    stop("Could not find start_marker or end_marker in pca_df.")
+  }
+  
+  flow_columns <- colnames(pca_df)[start_index:end_index]
+  
+  selected_columns <- pca_df[, flow_columns, drop = FALSE] %>%
+    mutate(across(everything(), as.numeric))
+  
+  selected_columns <- selected_columns[, colSums(!is.na(selected_columns)) > 0, drop = FALSE]
+  selected_columns <- selected_columns[, apply(selected_columns, 2, function(x) sd(x, na.rm = TRUE) > 0), drop = FALSE]
+  
+  complete_rows <- complete.cases(selected_columns)
+  
+  selected_columns_pca <- selected_columns[complete_rows, , drop = FALSE]
+  pca_meta <- pca_df[complete_rows, , drop = FALSE]
+}
+
+# ================================
+# Covariates used for flow PCA-based confounder assessment
+# ================================
+
+all_covariates_to_check <- c(
+  "AGE",
+  "SEX_BIRTH",
+  "TIMETOLAB",
+  "season_sin",
+  "season_cos",
+  "CENTER_RUMC",
+  "COVID_VACC"
+)
+
+# ================================
+# Continuous covariates only
+# Linearity is assessed only for these
+# ================================
+
+continuous_covariates <- c(
+  "AGE",
+  "TIMETOLAB",
+  "season_sin",
+  "season_cos"
+)
+
+# Optional: include these if present and used in your flow PCA assessment
+optional_continuous_covariates <- c(
+  "BMI_BASELINE",
+  "CD4_NADIR",
+  "CD4CD8_PRECART",
+  "VL_ZENITH"
+)
+
+all_covariates_to_check <- unique(c(
+  all_covariates_to_check,
+  optional_continuous_covariates[optional_continuous_covariates %in% colnames(pca_meta)]
+))
+
+continuous_covariates <- unique(c(
+  continuous_covariates,
+  optional_continuous_covariates[optional_continuous_covariates %in% colnames(pca_meta)]
+))
+
+# ================================
+# PCA on original flow data
+# ================================
+
+mypca_flow_assumption <- PCA(selected_columns_pca, ncp = 10, graph = FALSE)
+
+n_pc <- min(10, ncol(mypca_flow_assumption$ind$coord))
+
+pca_scores <- as.data.frame(mypca_flow_assumption$ind$coord[, 1:n_pc, drop = FALSE])
+colnames(pca_scores) <- paste0("Flow_PC", 1:n_pc)
+
+analysis_df <- cbind(pca_scores, pca_meta)
+
+all_covariates_to_check <- all_covariates_to_check[
+  all_covariates_to_check %in% colnames(analysis_df)
+]
+
+continuous_covariates <- continuous_covariates[
+  continuous_covariates %in% colnames(analysis_df)
+]
+
+# ================================
+# Run assumption checks
+# ================================
+
+results <- list()
+diagnostic_data <- list()
+
+for (pc in paste0("Flow_PC", 1:n_pc)) {
+  
+  for (covar in all_covariates_to_check) {
+    
+    tmp <- analysis_df[, c(pc, covar)]
+    tmp <- tmp[complete.cases(tmp), , drop = FALSE]
+    
+    if (nrow(tmp) < 20) next
+    
+    colnames(tmp) <- c("pc", "covar")
+    
+    tmp$pc <- as.numeric(tmp$pc)
+    
+    if (covar %in% continuous_covariates) {
+      tmp$covar <- suppressWarnings(as.numeric(tmp$covar))
+    } else {
+      tmp$covar <- as.factor(tmp$covar)
+    }
+    
+    tmp <- tmp[complete.cases(tmp), , drop = FALSE]
+    
+    if (nrow(tmp) < 20 || length(unique(tmp$covar)) < 2) next
+    
+    lm_fit <- tryCatch(
+      lm(pc ~ covar, data = tmp),
+      error = function(e) NULL
+    )
+    
+    if (is.null(lm_fit)) next
+    
+    bp_p <- tryCatch(
+      lmtest::bptest(lm_fit)$p.value,
+      error = function(e) NA_real_
+    )
+    
+    linearity_spline_p <- NA_real_
+    
+    if (covar %in% continuous_covariates && length(unique(tmp$covar)) >= 4) {
+      
+      spline_fit <- tryCatch(
+        lm(pc ~ splines::ns(covar, df = 3), data = tmp),
+        error = function(e) NULL
+      )
+      
+      if (!is.null(spline_fit)) {
+        linearity_spline_p <- tryCatch(
+          anova(lm_fit, spline_fit)$`Pr(>F)`[2],
+          error = function(e) NA_real_
+        )
+      }
+    }
+    
+    results[[length(results) + 1]] <- data.frame(
+      PC = pc,
+      Covariate = covar,
+      Variable_Type = ifelse(
+        covar %in% continuous_covariates,
+        "Continuous",
+        "Categorical"
+      ),
+      N = nrow(tmp),
+      Adj_R2 = summary(lm_fit)$adj.r.squared,
+      BreuschPagan_P = bp_p,
+      Linearity_Spline_P = linearity_spline_p
+    )
+    
+    diagnostic_data[[length(diagnostic_data) + 1]] <- data.frame(
+      PC = pc,
+      Covariate = covar,
+      Variable_Type = ifelse(
+        covar %in% continuous_covariates,
+        "Continuous",
+        "Categorical"
+      ),
+      Fitted = fitted(lm_fit),
+      Residual = residuals(lm_fit),
+      Std_Residual = rstandard(lm_fit)
+    )
+  }
+}
+
+results_df_flow <- bind_rows(results) %>%
+  arrange(PC, Covariate)
+
+diagnostics_df_flow <- bind_rows(diagnostic_data)
+
+# ================================
+# Save assumption test results
+# ================================
+
+write.xlsx(
+  results_df_flow,
+  file = file.path(out_dir, "Flow_PCA_Regression_Assumption_Checks.xlsx"),
+  sheetName = "Assumption_Checks",
+  overwrite = TRUE
+)
+
+# ================================
+# Diagnostic plots
+# Representative plots: Flow PC1-PC5 only
+# ================================
+
+pcs_for_plots <- paste0("Flow_PC", 1:min(5, n_pc))
+
+diagnostics_plot_flow <- diagnostics_df_flow %>%
+  filter(PC %in% pcs_for_plots)
+
+# ================================
+# 1) Q-Q plots
+# Answer: normality of residuals
+# ================================
+
+qq_plot_flow <- ggplot(diagnostics_plot_flow, aes(sample = Std_Residual)) +
+  stat_qq(size = 0.35, alpha = 0.5) +
+  stat_qq_line(linewidth = 0.4, color = "red") +
+  facet_grid(PC ~ Covariate, scales = "free_y") +
+  theme_bw(base_size = 8) +
+  theme(
+    strip.text.x = element_text(size = 7, angle = 90),
+    strip.text.y = element_text(size = 8),
+    axis.text = element_text(size = 6),
+    axis.title = element_text(size = 8),
+    plot.title = element_text(size = 11, face = "bold"),
+    plot.subtitle = element_text(size = 9)
+  ) +
+  labs(
+    title = "Q-Q plots of standardized residuals",
+    subtitle = "Assesses normality; Flow PCA regression models: Flow PC score ~ covariate",
+    x = "Theoretical quantiles",
+    y = "Standardized residuals"
+  )
+
+ggsave(
+  filename = file.path(out_dir, "Flow_PCA_Regression_QQ_Plots_Normality_PC1_to_PC5.pdf"),
+  plot = qq_plot_flow,
+  width = 18,
+  height = 10
+)
+
+ggsave(
+  filename = file.path(out_dir, "Flow_PCA_Regression_QQ_Plots_Normality_PC1_to_PC5.tiff"),
+  plot = qq_plot_flow,
+  width = 18,
+  height = 10,
+  dpi = 600,
+  units = "in",
+  device = "tiff"
+)
+
+# ================================
+# 2) Residuals vs fitted plots
+# Answer: homoscedasticity
+# Include continuous + categorical covariates
+# ================================
+
+homoscedasticity_plot_flow <- ggplot(diagnostics_plot_flow, aes(x = Fitted, y = Residual)) +
+  geom_point(size = 0.35, alpha = 0.5) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.4,
+    color = "red"
+  ) +
+  facet_grid(PC ~ Covariate, scales = "free_y") +
+  theme_bw(base_size = 8) +
+  theme(
+    strip.text.x = element_text(size = 7, angle = 90),
+    strip.text.y = element_text(size = 8),
+    axis.text = element_text(size = 6),
+    axis.title = element_text(size = 8),
+    plot.title = element_text(size = 11, face = "bold"),
+    plot.subtitle = element_text(size = 9)
+  ) +
+  labs(
+    title = "Residuals versus fitted values",
+    subtitle = "Assesses homoscedasticity; Flow PCA regression models: Flow PC score ~ covariate",
+    x = "Fitted values",
+    y = "Residuals"
+  )
+
+ggsave(
+  filename = file.path(out_dir, "Flow_PCA_Regression_Residuals_vs_Fitted_Homoscedasticity_PC1_to_PC5.pdf"),
+  plot = homoscedasticity_plot_flow,
+  width = 18,
+  height = 10
+)
+
+ggsave(
+  filename = file.path(out_dir, "Flow_PCA_Regression_Residuals_vs_Fitted_Homoscedasticity_PC1_to_PC5.tiff"),
+  plot = homoscedasticity_plot_flow,
+  width = 18,
+  height = 10,
+  dpi = 600,
+  units = "in",
+  device = "tiff"
+)
+
+# ================================
+# 3) Linearity plots
+# Answer: linearity
+# Continuous covariates only
+# Natural cubic spline smoother shown, not LOESS
+# ================================
+
+linearity_plot_df_flow <- diagnostics_plot_flow %>%
+  filter(Covariate %in% continuous_covariates)
+
+linearity_plot_flow <- ggplot(linearity_plot_df_flow, aes(x = Fitted, y = Residual)) +
+  geom_point(size = 0.35, alpha = 0.5) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.4,
+    color = "red"
+  ) +
+  geom_smooth(
+    method = "lm",
+    formula = y ~ splines::ns(x, df = 3),
+    se = FALSE,
+    linewidth = 0.5,
+    color = "blue"
+  ) +
+  facet_grid(PC ~ Covariate, scales = "free_y") +
+  theme_bw(base_size = 8) +
+  theme(
+    strip.text.x = element_text(size = 7),
+    strip.text.y = element_text(size = 8),
+    axis.text = element_text(size = 6),
+    axis.title = element_text(size = 8),
+    plot.title = element_text(size = 11, face = "bold"),
+    plot.subtitle = element_text(size = 9)
+  ) +
+  labs(
+    title = "Residual trends for continuous covariates",
+    subtitle = "Assesses linearity; natural cubic spline smoother shown",
+    x = "Fitted values",
+    y = "Residuals"
+  )
+
+ggsave(
+  filename = file.path(out_dir, "Flow_PCA_Regression_Linearity_Continuous_Covariates_PC1_to_PC5.pdf"),
+  plot = linearity_plot_flow,
+  width = 14,
+  height = 10
+)
+
+ggsave(
+  filename = file.path(out_dir, "Flow_PCA_Regression_Linearity_Continuous_Covariates_PC1_to_PC5.tiff"),
+  plot = linearity_plot_flow,
+  width = 14,
+  height = 10,
+  dpi = 600,
+  units = "in",
+  device = "tiff"
+)
+
+# ================================
+# Print results
+# ================================
+
+results_df_flow
+```
+
+#Analysis in DISCOVERY cohort
+```{r}
+library(dplyr)
+library(ggplot2)
+library(openxlsx)
+library(ggrepel)
+
+# Define Start and End Markers
+start_marker <- "Panel1_1012"
+end_marker <- "Panel3_3116"
+start_index <- which(colnames(merged_data_discovery) == start_marker)
+end_index <- which(colnames(merged_data_discovery) == end_marker)
+flow_columns <- colnames(merged_data_discovery)[start_index:end_index]
+
+# Inverse Rank Normalize
+merged_data_discovery[flow_columns] <- lapply(merged_data_discovery[flow_columns], function(x) {
+  qnorm((rank(x, na.last = "keep") - 0.5) / sum(!is.na(x)))
+})
+
+# Define Covariates
+covariates <- c("Tropism", "AGE", "SEX_BIRTH", "TIMETOLAB", "season_sin", "season_cos", "CENTER_RUMC", "COVID_VACC")
+
+# Run linear regression using lm for each marker
+results_list <- lapply(flow_columns, function(marker) {
+  formula <- as.formula(paste(marker, "~", paste(covariates, collapse = " + ")))
+  model <- lm(formula, data = merged_data_discovery)
+  coef_summary <- summary(model)$coefficients
+  if ("TropismX4" %in% rownames(coef_summary)) {
+    return(data.frame(
+      Cell_Population = marker,
+      Coefficient = coef_summary["TropismX4", "Estimate"],
+      P_Value = coef_summary["TropismX4", "Pr(>|t|)"]
+    ))
+  } else {
+    return(NULL)
+  }
+})
+
+# Combine results
+lm_results_df_discovery <- do.call(rbind, results_list) %>%
+  mutate(Adjusted_P_Value = p.adjust(P_Value, method = "BH")) %>%
+  arrange(Adjusted_P_Value) %>%
+  mutate(rank = row_number())
+
+
+# Merge with Full Marker Names
+lm_results_df_discovery <- lm_results_df_discovery %>%
+  left_join(name_mapping, by = c("Cell_Population" = "Trimmed_Name")) %>%
+  dplyr::select(Full_Name, Coefficient, P_Value, Adjusted_P_Value, rank) %>%
+  dplyr::rename(Cell_Population = Full_Name)
+
+# Save results
+write.xlsx(lm_results_df_discovery, "R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_Flow/Percentage/FlowCytometry_Results_discovery.xlsx")
+
+
+# Define FDR threshold
+fdr_threshold <- 0.05
+
+# Create short labels after second underscore
+lm_results_df_discovery <- lm_results_df_discovery %>%
+  mutate(
+    logP = -log10(Adjusted_P_Value),
+    Significance = ifelse(Adjusted_P_Value < fdr_threshold, "Significant", "Not Significant"),
+    Label_Short = sub("^(?:[^_]*_){2}", "", Cell_Population)
+  )
+
+# Volcano Plot
+ggplot(lm_results_df_discovery, aes(x = Coefficient, y = logP, color = Significance)) +
+  geom_point(alpha = 0.8, size = 3) +
+  geom_hline(yintercept = -log10(fdr_threshold), linetype = "dashed", color = "black") +
+  geom_text_repel(
+    data = subset(lm_results_df_discovery, Significance == "Significant"),
+    aes(label = Label_Short),
+    size = 4, max.overlaps = 50, force = 2
+  ) +
+  scale_color_manual(values = c("Significant" = "red", "Not Significant" = "black")) +
+  labs(
+    title = "Volcano Plot of Flow Cytometry Markers (DISCOVERY COHORT)",
+    x = "Log Fold Change (X4 vs R5)",
+    y = "-log10(Adjusted P-Value)",
+    color = "Significance Level"
+  ) +
+  theme_minimal()
+
+ggsave("R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_Flow/Percentage/Tropism_VolcanoPlot_discovery.tiff",
+       width = 10, height = 7, dpi = 300)
+
+# Dot Plot for significant markers
+significant_df_dis <- lm_results_df_discovery %>%
+  filter(Adjusted_P_Value < fdr_threshold) %>%
+  arrange(Adjusted_P_Value)
+
+if (nrow(significant_df_dis) == 0) {
+  stop("No significant markers found. Consider increasing the threshold (e.g., 0.1).")
+}
+
+ggplot(significant_df_dis, aes(x = Coefficient, y = reorder(Label_Short, Coefficient), color = Adjusted_P_Value)) +
+  geom_point(size = 8, alpha = 0.8) +
+  scale_color_gradient(low = "deepskyblue", high = "hotpink3", name = "FDR-adjusted P-value") +
+  labs(title = "Significant Flow Cytometry Markers (DISCOVERY COHORT)",
+       x = "Effect Size (Positive = Upregulated in X4)",
+       y = "Cell Population") +
+theme_minimal() +
+theme(
+  axis.text.y = element_text(size = 12),       # Marker label font size
+  axis.text.x = element_text(size = 12),       # X-axis numbers
+  axis.title = element_text(size = 13),        # Axis titles
+  plot.title = element_text(size = 12, face = "bold")  # Plot title
+)
+
+
+ggsave("R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_Flow/Percentage/DotPlot_Tropism_discovery.tiff",
+       width = 8, height = 6, dpi = 300)
+
+ggsave("R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_Flow/Percentage/DotPlot_Tropism_discovery.pdf",
+       width = 8, height = 6)
+
+
+```
+
+
+# Analysis in VALIDATION COHORT
+```{r}
+# Define Start and End Markers
+start_marker <- "Panel1_1012"
+end_marker <- "Panel3_3116"
+start_index <- which(colnames(merged_data_validation) == start_marker)
+end_index <- which(colnames(merged_data_validation) == end_marker)
+flow_columns <- colnames(merged_data_validation)[start_index:end_index]
+
+# Inverse Rank Normalize flow markers
+merged_data_validation[flow_columns] <- lapply(merged_data_validation[flow_columns], function(x) {
+  qnorm((rank(x, na.last = "keep") - 0.5) / sum(!is.na(x)))
+})
+
+# Define covariates
+covariates <- c("Tropism", "AGE", "SEX_BIRTH", "TIMETOLAB", "season_sin", "season_cos", "COVID_VACC")
+
+# Run lm for each marker and extract stats
+results_list <- lapply(flow_columns, function(marker) {
+  formula <- as.formula(paste(marker, "~", paste(covariates, collapse = " + ")))
+  model <- lm(formula, data = merged_data_validation)
+  coef_summary <- summary(model)$coefficients
+  if ("TropismX4" %in% rownames(coef_summary)) {
+    return(data.frame(
+      Cell_Population = marker,
+      Coefficient = coef_summary["TropismX4", "Estimate"],
+      P_Value = coef_summary["TropismX4", "Pr(>|t|)"]
+    ))
+  } else {
+    return(NULL)
+  }
+})
+
+# Combine results and adjust p-values
+lm_results_df_validation <- do.call(rbind, results_list) %>%
+  mutate(Adjusted_P_Value = p.adjust(P_Value, method = "BH")) %>%
+  arrange(Adjusted_P_Value) %>%
+  mutate(rank = row_number())
+
+# Merge with Full Marker Names
+lm_results_df_validation <- lm_results_df_validation %>%
+  left_join(name_mapping, by = c("Cell_Population" = "Trimmed_Name")) %>%
+  dplyr::select(Full_Name, Coefficient, P_Value, Adjusted_P_Value, rank) %>%
+  dplyr::rename(Cell_Population = Full_Name)
+
+# Save results
+write.xlsx(lm_results_df_validation, "R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_Flow/Percentage/FlowCytometry_Results_validation.xlsx", rowNames = FALSE)
+
+# Volcano Plot
+fdr_threshold <- 0.05
+lm_results_df_validation <- lm_results_df_validation %>%
+  mutate(
+    logP = -log10(P_Value),
+    Significance = ifelse(P_Value < fdr_threshold, "Significant", "Not Significant"),
+    Label_Short = sub("^(?:[^_]*_){2}", "", Cell_Population)
+  )
+
+ggplot(lm_results_df_validation, aes(x = Coefficient, y = logP, color = Significance)) +
+  geom_point(alpha = 0.8, size = 3) +
+  geom_hline(yintercept = -log10(fdr_threshold), linetype = "dashed", color = "black") +
+  geom_text_repel(
+    data = subset(lm_results_df_validation, Significance == "Significant"),
+    aes(label = Label_Short),
+    size = 4, max.overlaps = 50, force = 2
+  ) +
+  scale_color_manual(values = c("Significant" = "red", "Not Significant" = "black")) +
+  labs(title = "Volcano Plot of Flow Cytometry Markers (VALIDATION COHORT)",
+       x = "Log Fold Change (X4 vs R5)",
+       y = "-log10(P-Value)",
+       color = "Significance Level") +
+  theme_minimal()
+
+ggsave("R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_Flow/Percentage/Tropism_VolcanoPlot_validation.tiff", width = 10, height = 7, dpi = 300)
+
+# Dot Plot for significant markers
+significant_df_val <- lm_results_df_validation %>%
+  filter(P_Value < fdr_threshold) %>%
+  arrange(P_Value)
+
+if (nrow(significant_df_val) == 0) {
+  stop("No significant markers found. Consider increasing the threshold.")
+}
+
+
+ggplot(significant_df_val, aes(x = Coefficient, y = reorder(Label_Short, Coefficient), color = P_Value)) +
+  geom_point(size = 8, alpha = 0.8) +
+  scale_color_gradient(low = "deepskyblue", high = "hotpink3", name = "P_value") +
+  labs(title = "Significant Flow Cytometry Markers (VALIDATION COHORT)",
+       x = "Effect Size (Positive = Upregulated in X4)",
+       y = "Cell Population") +
+theme_minimal() +
+theme(
+  axis.text.y = element_text(size = 12),       # Marker label font size
+  axis.text.x = element_text(size = 12),       # X-axis numbers
+  axis.title = element_text(size = 13),        # Axis titles
+  plot.title = element_text(size = 12, face = "bold")  # Plot title
+)
+
+
+ggsave("R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_Flow/Percentage/DotPlot_Tropism_validation.tiff",
+       width = 8, height = 6, dpi = 300)
+
+ggsave("R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_Flow/Percentage/DotPlot_Tropism_validation.pdf",
+       width = 8, height = 6)
+
+
+```
+
+
+
+#Markers significant in Discovery and validation
+
+```{r}
+
+# Merge discovery and validation results (using full marker names already assigned earlier)
+merged_df <- inner_join(
+  lm_results_df_discovery %>% select(Cell_Population, Coefficient_discovery = Coefficient, Adjusted_P_Value),
+  lm_results_df_validation %>% select(Cell_Population, Coefficient_validation = Coefficient, P_Value),
+  by = "Cell_Population"
+)
+
+# Annotate significance group
+fdr_threshold <- 0.05
+merged_df <- merged_df %>%
+  mutate(Group = case_when(
+    Adjusted_P_Value < fdr_threshold & P_Value < fdr_threshold ~ "Validated direction and significance",
+    Adjusted_P_Value < fdr_threshold ~ "Significant in discovery only",
+    P_Value < fdr_threshold ~ "Significant in validation only",
+    TRUE ~ "Other"
+  ))
+
+# Add short labels
+merged_df <- merged_df %>%
+  mutate(Label_Short = sub("^(?:[^_]*_){2}", "", Cell_Population))
+
+# Highlight top validated markers
+top_labels <- merged_df %>%
+  filter(Group == "Validated direction and significance") %>%
+  arrange(Adjusted_P_Value) %>%
+  head(5)
+
+# Create quadrant scatter plot
+p <- ggplot(merged_df, aes(x = Coefficient_discovery, y = Coefficient_validation, color = Group)) +
+  geom_point(alpha = 0.8, size = 4) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  scale_color_manual(values = c(
+    "Validated direction and significance" = "hotpink3",
+    "Significant in discovery only" = "salmon2",
+    "Significant in validation only" = "cyan3",
+    "Other" = "grey"
+  )) +
+  labs(
+    title = "Effect Size in Discovery vs Validation",
+    x = "Discovery Effect Size (X4 - R5)",
+    y = "Validation Effect Size (X4 - R5)",
+    caption = "Positive = Upregulated in X4",
+    color = "Group"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 14),
+    legend.position = "right"
+  )
+
+# Add labels for top validated markers (shortened)
+if (nrow(top_labels) > 0) {
+  p <- p + geom_label_repel(
+    data = top_labels,
+    aes(label = Label_Short),
+    size = 4,
+    force = 5,
+    box.padding = 0.5,
+    point.padding = 0.3,
+    segment.color = "black",
+    segment.size = 0.7,
+    label.size = 0.5,
+    fill = "white"
+  )
+}
+
+# Save and display plot
+ggsave("R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_Flow/Percentage/Discovery_vs_Validation_lm_ScatterPlot.tiff",
+       plot = p, width = 10, height = 7, dpi = 300)
+print(p)
+
+ggsave("R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_Flow/Percentage/Discovery_vs_Validation_lm_ScatterPlot.pdf",
+       plot = p, width = 10, height = 7)
+
+
+```
+
+
+
+
+
+#heatmap
+```{r}
+# Load discovery and validation results
+discovery_df <- read.xlsx("R:/hcrc/Personal folders/Kavita Mehta/2000HIV_Flow/Percentage/FlowCytometry_Results_discovery.xlsx")
+validation_df <- read.xlsx("R:/hcrc/Personal folders/Kavita Mehta/2000HIV_Flow/Percentage/FlowCytometry_Results_validation.xlsx")
+
+# Merge discovery and validation
+merged_df <- discovery_df %>%
+  select(Cell_Population, Coefficient_discovery = Coefficient, Adjusted_P_Value_discovery = Adjusted_P_Value) %>%
+  left_join(
+    validation_df %>%
+      select(Cell_Population, Coefficient_validation = Coefficient, P_Value_validation = P_Value),
+    by = "Cell_Population"
+  )
+
+# Restore full marker names if needed
+merged_df <- merged_df %>%
+  left_join(name_mapping, by = c("Cell_Population" = "Trimmed_Name")) %>%
+  mutate(Cell_Population = ifelse(!is.na(Full_Name), Full_Name, Cell_Population)) %>%
+  select(-Full_Name)
+
+# Annotate significance
+merged_df <- merged_df %>%
+  mutate(
+    Significance_Label = case_when(
+      Adjusted_P_Value_discovery < 0.05 & P_Value_validation < 0.05 &
+        sign(Coefficient_discovery) == sign(Coefficient_validation) ~ "**",
+      Adjusted_P_Value_discovery < 0.05 & P_Value_validation >= 0.05 &
+        sign(Coefficient_discovery) == sign(Coefficient_validation) ~ "*^",
+      Adjusted_P_Value_discovery < 0.05 & P_Value_validation >= 0.05 &
+        sign(Coefficient_discovery) != sign(Coefficient_validation) ~ "*#",
+      Adjusted_P_Value_discovery < 0.05 ~ "*",
+      TRUE ~ ""
+    )
+  )
+
+# Define your markers and cells of interest
+markers_of_interest <- c("PD1+", "CD38+", "HLA-DR+", "HLA-DR+CD38+", "CXCR5+","CXCR4+", "CCR4+","CCR5+")
+cells_of_interest <- c("Treg", "mTreg", "nTreg","CD4+.Th1/17", "CD4+",  "CD4+.Tcm" , "CD4+.Th17", "CD4+.Th2", "CD4+.Th1", "CD4+.Tnaive","CD4+CD8-")
+
+# Extract and clean Main_Population and Sub_Marker (NO regex lookbehind!)
+merged_df_filtered <- merged_df %>%
+  mutate(
+    Main_Population = sub("^Panel\\d+_\\d+_", "", Cell_Population),      # Remove prefix
+    Main_Population = sub("_[^_]+$", "", Main_Population),               # Remove marker at end
+    Sub_Marker = sub(".*_", "", Cell_Population)                         # Extract last part
+  ) %>%
+  filter(
+    Sub_Marker %in% markers_of_interest,
+    Main_Population %in% cells_of_interest
+  )
+
+# Optional: Clean for plotting
+merged_df_filtered$Main_Population <- gsub("_", " ", merged_df_filtered$Main_Population)
+merged_df_filtered$Sub_Marker <- gsub("_", " ", merged_df_filtered$Sub_Marker)
+
+# Optional: Order factors
+merged_df_filtered$Main_Population <- factor(
+  merged_df_filtered$Main_Population,
+  levels = cells_of_interest
+)
+merged_df_filtered$Sub_Marker <- factor(
+  merged_df_filtered$Sub_Marker,
+  levels = markers_of_interest
+)
+
+
+
+# Step 1: Create all possible combinations
+all_combinations <- expand_grid(
+  Main_Population = unique(merged_df_filtered$Main_Population),
+  Sub_Marker = unique(merged_df_filtered$Sub_Marker)
+)
+
+# Step 2: Merge with your filtered data
+merged_full <- all_combinations %>%
+  left_join(merged_df_filtered, by = c("Main_Population", "Sub_Marker"))
+# Step 3: Plot
+ggplot(merged_full, aes(x = Sub_Marker, y = Main_Population, fill = Coefficient_discovery)) +
+  geom_tile(color = "white", size = 0.5, width = 1.1, height = 1.1) +
+  geom_text(aes(label = Significance_Label), size = 6, color = "black", na.rm = TRUE) +
+  scale_fill_gradient2(
+    low = "hotpink3", mid = "white", high = "deepskyblue", midpoint = 0,
+    na.value = "grey80",  # grey for missing combinations
+    name = "Estimate\n(X4 vs R5)"
+  ) +
+  labs(
+    title = "Selected CD4+ T-cell Subpopulations – Discovery Cohort (X4 vs R5)",
+    x = "Subpopulation Marker", y = "Main Cell Type",
+    caption = paste(
+      "**: Significant in both Discovery & Validation (same direction)\n",
+      "*^: Discovery significant, Validation not (same direction)\n",
+      "*#: Discovery significant, Validation not (opposite direction)\n"
+    )
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+    axis.text.y = element_text(size = 11),
+    plot.caption = element_text(hjust = 0, size = 12, face = "italic"),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 12),
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    plot.title = element_text(size = 14, face = "bold")
+  )
+
+# Save
+ggsave("R:/hcrc/Personal folders/Kavita Mehta/2000HIV_Flow/Percentage/CD4_Tsubset_TilePlot_Filtered_Full.tiff",
+       width = 8, height = 7, dpi = 300)
+ggsave("R:/hcrc/Personal folders/Kavita Mehta/2000HIV_Flow/Percentage/CD4_Tsubset_TilePlot_Filtered_Full.pdf",
+       width = 8, height = 7, )
+
+
+```
+
+#correlation plot for Treg-PD1 (95 CI) 
+```{r}
+# ============================================================
+# Correlation plots: Treg_PD1 vs selected variables
+# - Exports Pearson r, 95% CI, p-value to Excel
+# - Builds overall and tropism-stratified plots
+# - Safely handles log10 axes by filtering non-positive values
+# - Fixes duplicated "parse" warning from stat_cor()
+# ============================================================
+
+# ---- 1) Libraries ----
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(ggpubr)
+  library(writexl)
+  library(tibble)
+  library(grid)
+})
+
+# ---- 2) Set up output directory ----
+output_dir <- "R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_Flow/Percentage/correlation"
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+
+
+# ---- 4) Define variables ----
+pd1_col <- "Panel2_2124"
+
+plot_cols <- c(
+  "Panel2_2298",      # Treg_HLA-DR+
+  "Panel2_2240",      # Treg_CD38+
+  "Panel2_2356",      # Treg_CCR4+
+  "CD4_LATEST",
+  "Total_million_avg",
+  "Rainbow_DSI",
+  "longLTR_cp_Mio",
+  "POL_cp_Mio"
+)
+
+# ---- 5) Tropism colors ----
+trop_colors <- c(R5 = "aquamarine3", X4 = "coral", Mixed = "steelblue3")
+
+# ---- 6) Variables requiring log10 x-axis ----
+exp_vars <- c("Total_million_avg", "Rainbow_DSI", "longLTR_cp_Mio","POL_cp_Mio")
+
+# ---- 7) Friendly labels ----
+rename_map <- c(
+  Panel2_2298 = "Treg_HLA-DR+",
+  Panel2_2124 = "Treg_PD1",
+  Panel2_2240 = "Treg_CD38+",
+  Panel2_2356 = "Treg_CCR4+",
+  CD4_LATEST = "CD4 latest",
+  Total_million_avg = "Total HIV DNA",
+  Rainbow_DSI = "Intact HIV DNA",
+  longLTR_cp_Mio ="longLTR_RNA",
+  POL_cp_Mio = "POL_RNA"
+)
+
+# ---- 8) Helper: safe complete-case dataset for correlation ----
+get_cor_df <- function(data, xvar, yvar, log_x = FALSE) {
+  out <- data %>%
+    filter(!is.na(.data[[xvar]]), !is.na(.data[[yvar]]))
+
+  if (log_x) {
+    out <- out %>% filter(.data[[xvar]] > 0)
+  }
+
+  out
+}
+
+# ---- 9) Helper: safe Pearson correlation with 95% CI ----
+get_cor_results <- function(data, xvar, yvar, log_x = FALSE) {
+  sub <- get_cor_df(data, xvar, yvar, log_x = log_x)
+
+  n_complete <- nrow(sub)
+
+  if (n_complete < 4) return(NULL)
+  if (sd(sub[[xvar]]) == 0 || sd(sub[[yvar]]) == 0) return(NULL)
+
+  ct <- cor.test(
+    sub[[xvar]],
+    sub[[yvar]],
+    method = "pearson",
+    conf.level = 0.95
+  )
+
+  list(
+    N = n_complete,
+    r = unname(ct$estimate),
+    CI_lower_95 = unname(ct$conf.int[1]),
+    CI_upper_95 = unname(ct$conf.int[2]),
+    p_value = ct$p.value
+  )
+}
+
+# ---- 10) Helper: pretty log10 breaks based on actual data ----
+get_log_breaks <- function(x) {
+  x <- x[is.finite(x) & !is.na(x) & x > 0]
+  if (length(x) == 0) return(NULL)
+
+  min_exp <- floor(log10(min(x)))
+  max_exp <- ceiling(log10(max(x)))
+  10^(min_exp:max_exp)
+}
+
+# ---- 11) Results table ----
+results <- tibble(
+  FriendlyName = character(),
+  Variable     = character(),
+  Tropism      = character(),
+  N            = numeric(),
+  r            = double(),
+  CI_lower_95  = double(),
+  CI_upper_95  = double(),
+  p_value      = double()
+)
+
+# ---- 12) Lists to collect plots ----
+overall_list <- list()
+group_list   <- list()
+
+# ---- 13) Main loop ----
+for (col in plot_cols) {
+
+  if (!col %in% names(merged_data)) {
+    warning("Skipping ", col, ": not found in merged_data.")
+    next
+  }
+
+  log_x <- col %in% exp_vars
+
+  x_lab <- if (col %in% names(rename_map)) rename_map[[col]] else col
+  y_lab <- if (pd1_col %in% names(rename_map)) rename_map[[pd1_col]] else pd1_col
+
+  # ---------------- Correlation results: overall ----------------
+  ct_all <- get_cor_results(merged_data, col, pd1_col, log_x = log_x)
+
+  if (!is.null(ct_all)) {
+    results <- results %>%
+      add_row(
+        FriendlyName = x_lab,
+        Variable     = col,
+        Tropism      = "Overall",
+        N            = ct_all$N,
+        r            = ct_all$r,
+        CI_lower_95  = ct_all$CI_lower_95,
+        CI_upper_95  = ct_all$CI_upper_95,
+        p_value      = ct_all$p_value
+      )
+  }
+
+  # ---------------- Correlation results: by tropism ----------------
+  for (g in names(trop_colors)) {
+    sub_g <- merged_data %>% filter(Tropism == g)
+    ct_g <- get_cor_results(sub_g, col, pd1_col, log_x = log_x)
+
+    if (!is.null(ct_g)) {
+      results <- results %>%
+        add_row(
+          FriendlyName = x_lab,
+          Variable     = col,
+          Tropism      = g,
+          N            = ct_g$N,
+          r            = ct_g$r,
+          CI_lower_95  = ct_g$CI_lower_95,
+          CI_upper_95  = ct_g$CI_upper_95,
+          p_value      = ct_g$p_value
+        )
+    }
+  }
+
+  # ---------------- Plot data ----------------
+  plot_df <- merged_data %>%
+    filter(!is.na(.data[[col]]), !is.na(.data[[pd1_col]]), !is.na(Tropism))
+
+  if (log_x) {
+    plot_df <- plot_df %>% filter(.data[[col]] > 0)
+  }
+
+  # if too few rows, skip plotting
+  if (nrow(plot_df) < 4) {
+    warning("Skipping plot for ", col, ": too few complete observations.")
+    next
+  }
+
+  # x-axis breaks for log plots
+  log_breaks <- NULL
+  if (log_x) {
+    log_breaks <- get_log_breaks(plot_df[[col]])
+  }
+
+  # ---------------- Theme ----------------
+  my_theme <- theme_minimal(base_size = 10) +
+    theme(
+      axis.title   = element_text(color = "black"),
+      axis.text    = element_text(color = "black"),
+      legend.title = element_text(color = "black"),
+      legend.text  = element_text(color = "black"),
+      plot.title   = element_text(color = "black", hjust = 0.5)
+    )
+
+  title_overall <- sprintf("%s vs %s", y_lab, x_lab)
+  title_group   <- sprintf("%s vs %s", y_lab, x_lab)
+
+ 
+  # ---------------- Overall plot ----------------
+  p_overall <- ggplot(plot_df, aes_string(x = col, y = pd1_col)) +
+  geom_point(aes(color = Tropism), size = 0.5, alpha = 0.9) +
+  stat_smooth(
+    method = "lm",
+    se = TRUE,                 # <-- enables 95% CI shading
+    color = "black",
+    fill = "grey40",
+    alpha = 0.3, 
+    linewidth = 0.3
+  ) +
+  stat_cor(
+    aes(label = after_stat(paste(r.label, p.label, sep = "~`,`~"))),
+    method = "pearson",
+    label.x.npc = 0.52,
+    label.y.npc = "top",
+    size = 3
+  ) +
+  scale_color_manual(values = trop_colors) +
+  labs(title = title_overall, x = x_lab, y = y_lab, color = "Tropism") +
+  my_theme
+
+  # ---------------- Grouped plot ----------------
+  # ---------------- Grouped plot ----------------
+p_group <- ggplot(
+  plot_df,
+  aes_string(x = col, y = pd1_col, color = "Tropism", group = "Tropism")
+) +
+  geom_point(size = 0.5, alpha = 0.9) +
+  stat_smooth(
+    method = "lm",
+    se = TRUE,                 # <-- 95% CI shading
+    alpha = 0.2
+  ) +
+  stat_cor(
+    aes(label = after_stat(paste(r.label, p.label, sep = "~`,`~"))),
+    method = "pearson",
+    size = 3,
+    label.x.npc = 0.52,
+    label.y.npc = 0.99
+  ) +
+  scale_color_manual(values = trop_colors) +
+  labs(title = title_group, x = x_lab, y = y_lab, color = "Tropism") +
+  my_theme
+
+  # ---------------- Log10 scale if needed ----------------
+  if (log_x && !is.null(log_breaks) && length(log_breaks) > 0) {
+    p_overall <- p_overall +
+      scale_x_log10(
+        breaks = log_breaks,
+        labels = function(x) as.expression(lapply(log10(x), function(e) bquote(10^.(e))))
+      )
+
+    p_group <- p_group +
+      scale_x_log10(
+        breaks = log_breaks,
+        labels = function(x) as.expression(lapply(log10(x), function(e) bquote(10^.(e))))
+      )
+  }
+
+  # ---------------- Store plots ----------------
+  overall_list[[x_lab]] <- p_overall
+  group_list[[x_lab]]   <- p_group
+}
+
+# ---- 14) Add formatted CI column ----
+results <- results %>%
+  mutate(
+    CI_95 = paste0("(", round(CI_lower_95, 3), ", ", round(CI_upper_95, 3), ")")
+  )
+
+# ---- 15) Export correlations to Excel ----
+write_xlsx(
+  results,
+  path = file.path(output_dir, "TregPD1_correlations_with_95CI.xlsx")
+)
+
+# ---- 16) Add margins if enough plots exist ----
+n_overall <- length(overall_list)
+n_group   <- length(group_list)
+
+if (n_overall >= 3) {
+  for (i in 1:min(3, n_overall)) {
+    overall_list[[i]] <- overall_list[[i]] +
+      theme(plot.margin = unit(c(0, 0, 0.5, 0), "cm"))
+  }
+}
+if (n_group >= 3) {
+  for (i in 1:min(3, n_group)) {
+    group_list[[i]] <- group_list[[i]] +
+      theme(plot.margin = unit(c(0, 0, 0.5, 0), "cm"))
+  }
+}
+
+if (n_overall >= 6) {
+  for (i in 4:min(6, n_overall)) {
+    overall_list[[i]] <- overall_list[[i]] +
+      theme(plot.margin = unit(c(0.5, 0, 0, 0), "cm"))
+  }
+}
+if (n_group >= 6) {
+  for (i in 4:min(6, n_group)) {
+    group_list[[i]] <- group_list[[i]] +
+      theme(plot.margin = unit(c(0.5, 0, 0, 0), "cm"))
+  }
+}
+
+# ---- 17) Arrange plots ----
+multi_overall <- ggarrange(
+  plotlist = overall_list,
+  ncol     = 4,
+  nrow     = 2,
+  align    = "hv",
+  widths   = rep(1, 3),
+  heights  = rep(1, 3)
+)
+
+multi_tropism <- ggarrange(
+  plotlist = group_list,
+  ncol     = 4,
+  nrow     = 2,
+  align    = "hv",
+  widths   = rep(1, 3),
+  heights  = rep(1, 3)
+)
+
+# ---- 18) Save TIFF ----
+ggsave(
+  filename = file.path(output_dir, "tregPD1_overall.tiff"),
+  plot     = multi_overall,
+  width    = 12,
+  height   = 8,
+  dpi      = 300
+)
+
+ggsave(
+  filename = file.path(output_dir, "tregPD1_tropism.tiff"),
+  plot     = multi_tropism,
+  width    = 12,
+  height   = 8,
+  dpi      = 300
+)
+
+# ---- 19) Save PDF ----
+ggsave(
+  filename = file.path(output_dir, "tregPD1_overall.pdf"),
+  plot     = multi_overall,
+  device   = "pdf",
+  width    = 18,
+  height   = 8
+)
+
+ggsave(
+  filename = file.path(output_dir, "tregPD1_tropism.pdf"),
+  plot     = multi_tropism,
+  device   = "pdf",
+  width    = 18,
+  height   = 8
+)
+```
+
