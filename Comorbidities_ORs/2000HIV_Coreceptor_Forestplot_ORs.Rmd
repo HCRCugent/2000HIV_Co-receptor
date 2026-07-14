@@ -1,0 +1,1998 @@
+---
+title: "2000HIV_Co-receptor_Forestplot_ORs"
+author: "Kavita Mehta"
+date: "2026-01-20"
+output: html_document
+---
+
+#Setup chunk (runs once, shared by all later chunks)
+```{r}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+suppressPackageStartupMessages({
+library(readxl)
+library(dplyr)
+library(tibble)
+library(openxlsx)
+library(ggplot2)
+library(cowplot)
+library(gridExtra)
+library(purrr)
+library(stringr)
+library(tidyr)
+library(scales)
+library(reshape2)
+})
+
+# ---- Paths ----
+
+file_path <- "S:/hcrc/Personal folders/Kavita Mehta/2000HIV/clinical data/KAVITA_IMPUT_DATAFRAME_SMOKING_CURRENT_RESOLVED.xlsx"
+base_out  <- "S:/hcrc/Personal folders/Kavita Mehta/Manuscripts/2000HIV_Tropism"
+
+# ---- Read once ----
+
+df_raw <- read_excel(file_path)
+
+# ---- Common cohort filter functions ----
+
+prep_r5x4 <- function(df) {
+df %>%
+filter(Tropism %in% c("R5","X4"),
+CONTROLLER_1B != "EC_persistent") %>%
+mutate(Tropism = factor(Tropism, levels = c("R5","X4")))
+}
+
+
+# ---- Derived columns (shared) ----
+
+add_derived_cols <- function(df) {
+df %>%
+mutate(
+lo_vs_rest = if_else(ViReTgroup == "LoViReT", 1, 0, missing = NA_real_),
+hi_vs_rest = if_else(ViReTgroup == "HiViReT", 1, 0, missing = NA_real_),
+hi_vs_lo   = case_when(
+ViReTgroup == "HiViReT" ~ 1,
+ViReTgroup == "LoViReT" ~ 0,
+TRUE ~ NA_real_
+),
+CDC3 = if_else(HIV_STAGE_CDC == 2, 1L, 0L, missing = NA_integer_)
+) %>%
+mutate(
+Steatosis_yesno = case_when(
+is.na(Steatosis_yesno) ~ NA_character_,
+trimws(Steatosis_yesno) %in% c("S1","S2","S3","S1-S3") ~ "S1-S3",
+trimws(Steatosis_yesno) == "S0" ~ "S0",
+TRUE ~ NA_character_
+),
+Steatosis_yesno = factor(Steatosis_yesno, levels = c("S0","S1-S3"))
+)
+}
+
+# ---- Helper: coerce outcome to 0/1 when needed ----
+
+coerce_binary01 <- function(x){
+if (is.numeric(x)) return(x)
+if (is.factor(x) && nlevels(x) == 2L) return(as.integer(x) - 1L)
+if (is.logical(x)) return(as.integer(x))
+if (is.character(x)) {
+ux <- sort(unique(na.omit(x)))
+if (length(ux) == 2L) return(as.integer(factor(x, levels = ux)) - 1L)
+}
+suppressWarnings(as.numeric(x))
+}
+
+fmt_p <- function(p){
+ifelse(is.na(p), NA_character_,
+ifelse(p < 0.001, "<0.001", sprintf("%.3f", p)))
+}
+
+
+```
+
+
+#correlation heatmap of the variables
+```{r}
+# ---- Covariate correlation heatmap with BH-adjusted significance ----
+
+# Variables to include
+covars_heatmap <- c(
+  "SMOKING_CURRENT",
+  "CD4_NADIR",
+  "CD4_PRECART",
+  "SEX_BIRTH",
+  "BMI_BASELINE",
+  "TIMETOCART",
+  "DM",
+  "AGE",
+  "CART_DURATION",
+  "HT",
+  "HC",
+  "VL_ZENITH")
+
+# Prepare data
+df_cor <- df_raw %>%
+  prep_r5x4() %>%
+  add_derived_cols() %>%
+  select(all_of(covars_heatmap))
+
+# Convert variables to numeric for correlation
+to_numeric_for_cor <- function(x) {
+  if (is.numeric(x)) return(as.numeric(x))
+  if (is.logical(x)) return(as.numeric(x))
+  
+  if (is.factor(x)) {
+    if (nlevels(x) == 2) return(as.numeric(x) - 1)
+    return(as.numeric(x))
+  }
+  
+  if (is.character(x)) {
+    x_trim <- trimws(x)
+    
+    if (all(na.omit(unique(x_trim)) %in% c("0", "1"))) {
+      return(as.numeric(x_trim))
+    }
+    
+    ux <- sort(unique(na.omit(x_trim)))
+    if (length(ux) == 2) {
+      return(as.numeric(factor(x_trim, levels = ux)) - 1)
+    }
+    
+    x_num <- suppressWarnings(as.numeric(x_trim))
+    if (!all(is.na(x_num))) return(x_num)
+    
+    return(as.numeric(factor(x_trim)))
+  }
+  
+  suppressWarnings(as.numeric(x))
+}
+
+df_cor_num <- df_cor %>%
+  mutate(across(everything(), to_numeric_for_cor))
+
+# Convert to base numeric matrix
+mat_cor <- as.matrix(df_cor_num)
+storage.mode(mat_cor) <- "numeric"
+
+# Spearman correlation matrix
+cor_mat <- cor(mat_cor, use = "pairwise.complete.obs", method = "spearman")
+
+# Function to compute raw p-values
+cor_pmat <- function(mat) {
+  n <- ncol(mat)
+  p_mat <- matrix(NA_real_, n, n)
+  colnames(p_mat) <- colnames(mat)
+  rownames(p_mat) <- colnames(mat)
+  
+  for (i in seq_len(n)) {
+    for (j in seq_len(n)) {
+      x <- as.numeric(mat[, i])
+      y <- as.numeric(mat[, j])
+      keep <- complete.cases(x, y)
+      
+      if (sum(keep) >= 3) {
+        p_mat[i, j] <- suppressWarnings(
+          cor.test(x[keep], y[keep], method = "spearman", exact = FALSE)$p.value
+        )
+      } else {
+        p_mat[i, j] <- NA_real_
+      }
+    }
+  }
+  p_mat
+}
+
+p_mat <- cor_pmat(mat_cor)
+
+# ---- Adjust p-values using only unique pairs from one triangle ----
+p_adj_mat <- matrix(NA_real_, nrow = nrow(p_mat), ncol = ncol(p_mat),
+                    dimnames = dimnames(p_mat))
+
+# lower triangle including diagonal
+lt_idx <- lower.tri(p_mat, diag = TRUE)
+
+# adjust only non-NA values from lower triangle
+p_vals_lt <- p_mat[lt_idx]
+non_na_lt <- !is.na(p_vals_lt)
+
+p_adj_lt <- rep(NA_real_, length(p_vals_lt))
+p_adj_lt[non_na_lt] <- p.adjust(p_vals_lt[non_na_lt], method = "BH")
+
+# put adjusted values back into lower triangle
+p_adj_mat[lt_idx] <- p_adj_lt
+
+# mirror to upper triangle so lookup works everywhere
+p_adj_mat[upper.tri(p_adj_mat)] <- t(p_adj_mat)[upper.tri(p_adj_mat)]
+
+# Convert to long format
+cor_long   <- reshape2::melt(cor_mat,   varnames = c("Var1", "Var2"), value.name = "r")
+p_long     <- reshape2::melt(p_mat,     varnames = c("Var1", "Var2"), value.name = "p_raw")
+padj_long  <- reshape2::melt(p_adj_mat, varnames = c("Var1", "Var2"), value.name = "p_adj")
+
+df_plot <- cor_long %>%
+  left_join(p_long,    by = c("Var1", "Var2")) %>%
+  left_join(padj_long, by = c("Var1", "Var2"))
+
+# Keep order
+df_plot$Var1 <- factor(df_plot$Var1, levels = rownames(cor_mat))
+df_plot$Var2 <- factor(df_plot$Var2, levels = colnames(cor_mat))
+
+# Show labels only on one half; asterisk based on adjusted p-value
+df_plot <- df_plot %>%
+  mutate(
+    x_id = as.numeric(Var2),
+    y_id = as.numeric(Var1),
+    label = ifelse(
+      y_id >= x_id,
+      paste0(
+        sprintf("%.2f", r),
+        ifelse(!is.na(p_adj) & p_adj < 0.05, "*", "")
+      ),
+      NA_character_
+    )
+  )
+
+# Plot
+p_cor <- ggplot(df_plot, aes(x = Var2, y = Var1, fill = r)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = label), size = 3, na.rm = TRUE) +
+  scale_fill_gradient2(
+    low = "cyan2",
+    mid = "white",
+    high = "hotpink",
+    midpoint = 0,
+    limits = c(-1, 1),
+    name = "Corr"
+  ) +
+  coord_fixed() +
+  labs(title = "Covariate correlation heatmap", x = NULL, y = NULL) +
+  theme_minimal(base_size = 10) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    panel.grid = element_blank()
+  )
+
+# Display
+p_cor
+
+# Save PDF
+ggsave(
+  filename = file.path(base_out, "Covariate_Correlation_Heatmap.pdf"),
+  plot = p_cor,
+  width = 8,
+  height = 7
+)
+
+# Save TIFF
+ggsave(
+  filename = file.path(base_out, "Covariate_Correlation_Heatmap.tiff"),
+  plot = p_cor,
+  width = 8,
+  height = 7,
+  dpi = 600,
+  compression = "lzw"
+)
+
+# ---- Save correlation results to Excel ----
+
+df_export <- df_plot %>%
+  mutate(
+    Var1 = as.character(Var1),
+    Var2 = as.character(Var2)
+  ) %>%
+  select(Var1, Var2, r, p_raw, p_adj) %>%
+  arrange(Var1, Var2)
+
+df_export_lower <- df_export %>%
+  mutate(
+    x_id = as.numeric(factor(Var2, levels = colnames(cor_mat))),
+    y_id = as.numeric(factor(Var1, levels = rownames(cor_mat)))
+  ) %>%
+  filter(y_id >= x_id) %>%
+  select(-x_id, -y_id)
+
+wb <- createWorkbook()
+
+addWorksheet(wb, "All_pairs")
+writeData(wb, "All_pairs", df_export)
+
+addWorksheet(wb, "Lower_triangle")
+writeData(wb, "Lower_triangle", df_export_lower)
+
+addWorksheet(wb, "Correlation_matrix")
+writeData(wb, "Correlation_matrix", round(cor_mat, 3), rowNames = TRUE)
+
+addWorksheet(wb, "Raw_p_matrix")
+writeData(wb, "Raw_p_matrix", signif(p_mat, 3), rowNames = TRUE)
+
+addWorksheet(wb, "Adj_p_matrix")
+writeData(wb, "Adj_p_matrix", signif(p_adj_mat, 3), rowNames = TRUE)
+
+saveWorkbook(
+  wb,
+  file = file.path(base_out, "Covariate_Correlation_Results.xlsx"),
+  overwrite = TRUE
+)
+```
+
+#covariates correction for variables (different sets of covariates)
+```{r}
+setwd(file.path(base_out, "covariates"))
+
+df <- df_raw %>% prep_r5x4() %>% add_derived_cols()
+
+filter_suffix <- paste0(
+"Tropism_",
+paste(levels(df$Tropism), collapse = "_"),
+"_Excl_EC"
+)
+
+is_binary_col <- function(x) {
+u <- unique(na.omit(x))
+all(as.character(u) %in% c("0","1")) && length(u) == 2
+}
+all_cols    <- names(df)
+binary_cols <- all_cols[sapply(df, is_binary_col)]
+df[binary_cols] <- lapply(df[binary_cols], function(x) as.numeric(as.character(x)))
+continuous_cols <- names(df)[sapply(df, is.numeric) & !names(df) %in% binary_cols]
+
+covariate_sets <- list(
+NONE                = character(0),
+AGE_SEX_TIMETOcART  = c("AGE","SEX_BIRTH","TIMETOCART")
+)
+
+
+for (cov_name in names(covariate_sets)) {
+covs       <- covariate_sets[[cov_name]]
+results_ls <- list()
+
+for (col in c(binary_cols, continuous_cols)) {
+vars_needed <- c(col, "Tropism", covs)
+df_sub <- df %>%
+select(all_of(vars_needed)) %>%
+filter(!is.na(.data[[col]])) %>%
+na.omit()
+
+if (length(unique(df_sub$Tropism)) < 2) next
+
+if (length(covs) > 0) {
+  facs <- covs[sapply(df_sub[covs], \(x) is.factor(x) || is.character(x))]
+  if (length(facs) > 0) {
+    lvl_counts <- sapply(facs, \(v) length(unique(df_sub[[v]])))
+    if (any(lvl_counts < 2)) next
+  }
+}
+
+N_R5 <- sum(df_sub$Tropism == "R5")
+N_X4 <- sum(df_sub$Tropism == "X4")
+
+if (col %in% binary_cols) {
+  n1_R5   <- sum(df_sub[[col]] == 1 & df_sub$Tropism == "R5", na.rm = TRUE)
+  n1_X4   <- sum(df_sub[[col]] == 1 & df_sub$Tropism == "X4", na.rm = TRUE)
+  pct1_R5 <- ifelse(N_R5 > 0, n1_R5 / N_R5 * 100, NA_real_)
+  pct1_X4 <- ifelse(N_X4 > 0, n1_X4 / N_X4 * 100, NA_real_)
+} else {
+  n1_R5 <- n1_X4 <- NA_integer_
+  pct1_R5 <- pct1_X4 <- NA_real_
+}
+
+resp <- paste0("`", col, "`")
+rhs  <- paste(c("Tropism", covs), collapse = " + ")
+fml  <- as.formula(paste(resp, "~", rhs))
+
+if (col %in% binary_cols) {
+  mod  <- suppressWarnings(glm(fml, data = df_sub, family = binomial))
+  sm   <- summary(mod)
+  est  <- coef(mod)["TropismX4"]
+  se   <- sm$coefficients["TropismX4","Std. Error"]
+  pval <- sm$coefficients["TropismX4","Pr(>|z|)"]
+  estimate <- exp(est)
+  ci_lower <- exp(est - 1.96*se)
+  ci_upper <- exp(est + 1.96*se)
+  effect <- "OR"
+} else {
+  mod  <- lm(fml, data = df_sub)
+  sm   <- summary(mod)
+  est  <- coef(mod)["TropismX4"]
+  se   <- sm$coefficients["TropismX4","Std. Error"]
+  pval <- sm$coefficients["TropismX4","Pr(>|t|)"]
+  estimate <- est
+  ci_lower <- est - 1.96*se
+  ci_upper <- est + 1.96*se
+  effect <- "Beta"
+}
+
+results_ls[[col]] <- tibble(
+  Variable   = col,
+  Type       = if_else(col %in% binary_cols, "binary", "continuous"),
+  N_R5       = N_R5,
+  N_X4       = N_X4,
+  Count1_R5  = n1_R5,
+  Pct1_R5    = pct1_R5,
+  Count1_X4  = n1_X4,
+  Pct1_X4    = pct1_X4,
+  Estimate   = estimate,
+  CI_Lower   = ci_lower,
+  CI_Upper   = ci_upper,
+  PValue_raw = pval,
+  Effect     = effect
+)
+
+
+}
+
+final_df <- bind_rows(results_ls) %>%
+mutate(Signif_raw = case_when(
+PValue_raw < 0.001 ~ "***",
+PValue_raw < 0.01  ~ "**",
+PValue_raw < 0.05  ~ "*",
+TRUE               ~ ""
+))
+
+wb <- createWorkbook()
+addWorksheet(wb, "Results")
+writeData(wb, "Results", final_df)
+saveWorkbook(wb,
+paste0("Mixed_Models_", cov_name, "_", filter_suffix, ".xlsx"),
+overwrite = TRUE)
+
+p_bin <- final_df %>%
+filter(Type == "binary" & PValue_raw < 0.05) %>%
+ggplot(aes(x = Estimate, y = reorder(Variable, Estimate))) +
+geom_point(size = 3) +
+geom_errorbarh(aes(xmin = CI_Lower, xmax = CI_Upper), height = 0.2) +
+scale_x_log10() +
+geom_vline(xintercept = 1, linetype = "dashed") +
+labs(title = paste("Binary (OR) —", cov_name),
+x = "Odds Ratio (log scale)", y = NULL) +
+theme_minimal()
+
+p_cont <- final_df %>%
+filter(Type == "continuous" & PValue_raw < 0.05) %>%
+ggplot(aes(x = Estimate, y = reorder(Variable, Estimate))) +
+geom_point(size = 3) +
+geom_errorbarh(aes(xmin = CI_Lower, xmax = CI_Upper), height = 0.2) +
+geom_vline(xintercept = 0, linetype = "dashed") +
+labs(title = paste("Continuous (Beta) —", cov_name),
+x = "Beta coefficient", y = NULL) +
+theme_minimal()
+
+ggsave(
+paste0("ForestPlot_", cov_name, "_SigOnly_", filter_suffix, ".pdf"),
+plot_grid(p_bin, p_cont, ncol = 2, rel_widths = c(0.5, 0.5)),
+width = 12, height = 6
+)
+}
+
+```
+#ORs_Logistic regression and forest plot of selected clinical outcomes
+
+This chunk runs unadjusted and adjusted logistic regression analyses for a predefined set of binary clinical outcomes, comparing X4 vs R5 tropism. The variables can be decided based on previous chunk or based on relevance for manuscript.
+
+For each outcome:
+ 1) Fit an unadjusted model: outcome ~ Tropism
+ 2) Fit an adjusted model:  outcome ~ Tropism + outcome-specific covariates
+ 3) Extract ORs, 95% CIs, p-values, and event counts per group
+ 
+The results are:
+- Saved to an Excel file (one row per model per outcome)
+- Summarized into a single forest plot showing raw and adjusted ORs
+```{r}
+setwd(file.path(base_out, "ORs"))
+
+df <- df_raw %>% prep_r5x4() %>% add_derived_cols()
+
+# ---- Outcomes -> covariates map ----
+
+var_covs <- list(
+"CDC3"                    = c("AGE","SEX_BIRTH" ,"TIMETOCART"),
+"OPP_AIDS_DEF"            = c("AGE","SEX_BIRTH","TIMETOCART"),
+"OTHER_AIDS_DEF"          = c("AGE","SEX_BIRTH","TIMETOCART"),
+"INR_Willem2"              = c("AGE","SEX_BIRTH","TIMETOCART"),
+"MH_PSY_D.Other"          = c("AGE","SEX_BIRTH","TIMETOCART"),
+"MED_PSY.Antipsychotics"  = c("AGE","SEX_BIRTH","TIMETOCART"),
+"MED_PSY.Benzodiazepines" = c("AGE","SEX_BIRTH","TIMETOCART"),
+"MH_TR_END_D.DM2"         = c("AGE","SEX_BIRTH","TIMETOCART","BMI_BASELINE","SMOKING_CURRENT"),
+"Plaque"                  = c("AGE","SEX_BIRTH","TIMETOCART","HT", "DM","HC","BMI_BASELINE","SMOKING_CURRENT"),
+"MALIG_NONAIDS"           = c("AGE","SEX_BIRTH","TIMETOCART","SMOKING_CURRENT","ALCOHOL_UNITS_WEEK"),
+"CVD_baseline"            = c("AGE","SEX_BIRTH","TIMETOCART","BMI_BASELINE","HT","HC","DM","SMOKING_CURRENT"),
+"Steatosis_yesno"         = c("AGE","SEX_BIRTH","TIMETOCART","BMI_BASELINE","HT","HC","DM","SMOKING_CURRENT"),
+"hi_vs_rest"              = c("AGE","SEX_BIRTH","TIMETOCART")
+)
+
+library(splines)
+
+check_linearity_one <- function(df, y, covs, var = c("AGE","BMI_BASELINE"), df_spline = 3) {
+  var <- match.arg(var)
+
+  cols <- unique(c(y, "Tropism", covs))
+  d <- df %>%
+    select(any_of(cols)) %>%
+    mutate("{y}" := coerce_binary01(.data[[y]])) %>%
+    filter(!is.na(.data[[y]])) %>%
+    na.omit()
+
+  # Need variation + enough rows
+  if (nrow(d) < 50) return(NULL)
+  if (!all(sort(unique(d[[y]])) %in% c(0,1))) return(NULL)
+  if (length(unique(d$Tropism)) < 2) return(NULL)
+  if (!var %in% names(d)) return(NULL)
+  if (all(is.na(d[[var]]))) return(NULL)
+  if (length(unique(d[[var]])) < 5) return(NULL)
+
+  # Linear model
+  rhs_lin <- paste(c("Tropism", covs), collapse = " + ")
+  f_lin   <- as.formula(sprintf("`%s` ~ %s", y, rhs_lin))
+  m_lin   <- suppressWarnings(glm(f_lin, data = d, family = binomial))
+
+  # Spline model: replace var with ns(var, df)
+  covs_spl <- covs
+  covs_spl[covs_spl == var] <- sprintf("ns(%s, df=%d)", var, df_spline)
+  rhs_spl <- paste(c("Tropism", covs_spl), collapse = " + ")
+  f_spl   <- as.formula(sprintf("`%s` ~ %s", y, rhs_spl))
+  m_spl   <- suppressWarnings(glm(f_spl, data = d, family = binomial))
+
+  # Likelihood ratio test (does spline improve fit?)
+  lrt <- anova(m_lin, m_spl, test = "LRT")
+
+  tibble(
+    Outcome = y,
+    Variable = var,
+    LRT_p = lrt$`Pr(>Chi)`[2],
+    AIC_linear = AIC(m_lin),
+    AIC_spline = AIC(m_spl),
+    N = nrow(d)
+  )
+}
+# Check linearity for AGE and BMI_BASELINE in adjusted models (where present)
+lin_checks <- purrr::imap_dfr(var_covs, function(covs, y) {
+  bind_rows(
+    if ("AGE" %in% covs) check_linearity_one(df, y, covs, var = "AGE") else NULL,
+    if ("BMI_BASELINE" %in% covs) check_linearity_one(df, y, covs, var = "BMI_BASELINE") else NULL
+  )
+})
+
+lin_checks <- lin_checks %>% arrange(LRT_p)
+
+# Save for documentation
+timestamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
+write.xlsx(lin_checks, paste0("Linearity_checks_splines_", timestamp, ".xlsx"))
+lin_checks
+
+# ---- Fit function: Unadjusted + Adjusted rows with counts ----
+fit_unadj_adj <- function(y, covs) {
+
+# Unadjusted
+
+d_u <- df %>%
+select(all_of(c(y, "Tropism"))) %>%
+mutate("{y}" := coerce_binary01(.data[[y]])) %>%
+filter(!is.na(.data[[y]])) %>%
+na.omit()
+
+if (!all(sort(unique(d_u[[y]])) %in% c(0,1))) return(NULL)
+if (length(unique(d_u$Tropism)) < 2) return(NULL)
+
+N_R5_u  <- sum(d_u$Tropism == "R5")
+N_X4_u  <- sum(d_u$Tropism == "X4")
+Ev_R5_u <- sum(d_u[[y]] == 1 & d_u$Tropism == "R5")
+Ev_X4_u <- sum(d_u[[y]] == 1 & d_u$Tropism == "X4")
+
+f0 <- as.formula(sprintf("`%s` ~ Tropism", y))
+m0 <- suppressWarnings(glm(f0, data = d_u, family = binomial))
+co0 <- summary(m0)$coefficients
+if (!"TropismX4" %in% rownames(co0)) return(NULL)
+b0  <- co0["TropismX4","Estimate"]
+se0 <- co0["TropismX4","Std. Error"]
+p0  <- co0["TropismX4","Pr(>|z|)"]
+
+# Adjusted
+
+cols_a <- unique(c(y, "Tropism", covs))
+d_a <- df %>%
+select(any_of(cols_a)) %>%
+mutate("{y}" := coerce_binary01(.data[[y]])) %>%
+filter(!is.na(.data[[y]])) %>%
+na.omit()
+
+if (length(unique(d_a$Tropism)) < 2) return(NULL)
+
+N_R5_a  <- sum(d_a$Tropism == "R5")
+N_X4_a  <- sum(d_a$Tropism == "X4")
+Ev_R5_a <- sum(d_a[[y]] == 1 & d_a$Tropism == "R5")
+Ev_X4_a <- sum(d_a[[y]] == 1 & d_a$Tropism == "X4")
+
+rhs <- paste(c("Tropism", covs), collapse = " + ")
+f1  <- as.formula(sprintf("`%s` ~ %s", y, rhs))
+m1  <- suppressWarnings(glm(f1, data = d_a, family = binomial))
+co1 <- summary(m1)$coefficients
+if (!"TropismX4" %in% rownames(co1)) return(NULL)
+b1  <- co1["TropismX4","Estimate"]
+se1 <- co1["TropismX4","Std. Error"]
+p1  <- co1["TropismX4","Pr(>|z|)"]
+
+tibble(
+Outcome   = y,
+Model     = c("Unadjusted","Adjusted"),
+OR        = exp(c(b0, b1)),
+CI_Lower  = exp(c(b0 - 1.96*se0, b1 - 1.96*se1)),
+CI_Upper  = exp(c(b0 + 1.96*se0, b1 + 1.96*se1)),
+PValue    = c(p0, p1),
+Covariates= c("none", paste(covs, collapse = ", ")),
+N_R5      = c(N_R5_u, N_R5_a),
+N_X4      = c(N_X4_u, N_X4_a),
+Events_R5 = c(Ev_R5_u, Ev_R5_a),
+Events_X4 = c(Ev_X4_u, Ev_X4_a)
+)
+}
+
+# ---- Run models across outcomes ----
+
+res <- purrr::imap_dfr(var_covs, ~fit_unadj_adj(.y, .x)) %>%
+mutate(
+Outcome = factor(Outcome, levels = names(var_covs)),
+Pct_X4  = ifelse(N_X4 > 0, 100 * Events_X4 / N_X4, NA_real_),
+Pct_R5  = ifelse(N_R5 > 0, 100 * Events_R5 / N_R5, NA_real_)
+)
+
+# ---- Save results to Excel ----
+
+ts <- format(as.POSIXct(Sys.time(), tz = "Europe/Brussels"), "%Y%m%d_%H%M%S")
+xlsx_name <- paste0("Outcomes_Unadj_vs_Adj_CustomCovs_risk_factors", ts, ".xlsx")
+
+wb <- createWorkbook()
+addWorksheet(wb, "Results_Unadj_Adj_withCounts")
+writeData(wb, "Results_Unadj_Adj_withCounts", res)
+saveWorkbook(wb, xlsx_name, overwrite = TRUE)
+
+# ---- Build forest table ----
+
+adj <- res %>%
+filter(Model == "Adjusted") %>%
+transmute(
+Outcome,
+adjOR = OR, adj_L = CI_Lower, adj_U = CI_Upper,
+adj_p = PValue,
+Covariates,
+N_R5 = N_R5, N_X4 = N_X4, Ev_R5 = Events_R5, Ev_X4 = Events_X4
+)
+
+raw <- res %>%
+filter(Model == "Unadjusted") %>%
+transmute(
+Outcome,
+rawOR = OR, raw_L = CI_Lower, raw_U = CI_Upper,
+raw_p = PValue
+)
+
+forest_df <- left_join(adj, raw, by = "Outcome") %>%
+mutate(
+Outcome   = factor(Outcome, levels = names(var_covs)),
+raw_p_lab = fmt_p(raw_p),
+adj_p_lab = fmt_p(adj_p),
+Pct_X4    = ifelse(N_X4 > 0, 100 * Ev_X4 / N_X4, NA_real_),
+Pct_R5    = ifelse(N_R5 > 0, 100 * Ev_R5 / N_R5, NA_real_)
+) %>%
+arrange(Outcome)
+
+# ---- Right-side tables (REORDERED): Outcome | R5 | X4 | raw OR | raw p | adj OR | adj p | Covariates ----
+
+# (Optional) wrap covariates if they are long
+# forest_df <- forest_df %>% mutate(Covariates = stringr::str_wrap(Covariates, width = 45))
+
+counts_tbl <- forest_df %>%
+  transmute(
+    Outcome   = as.character(Outcome),
+    `R5 n(%)` = ifelse(is.na(Ev_R5) | is.na(Pct_R5), "",
+                       paste0(Ev_R5, " (", round(Pct_R5), "%)")),
+    `X4 n(%)` = ifelse(is.na(Ev_X4) | is.na(Pct_X4), "",
+                       paste0(Ev_X4, " (", round(Pct_X4), "%)"))
+  )
+
+tg <- tableGrob(
+  counts_tbl, rows = NULL,
+  theme = ttheme_minimal(
+    core    = list(fg_params = list(hjust = 0, x = 0)),
+    colhead = list(fg_params = list(hjust = 0, x = 0))
+  )
+)
+
+# raw OR + raw p
+rg <- tableGrob(
+  data.frame(
+    `raw OR` = sprintf("%.2f", forest_df$rawOR),
+    `raw p`  = forest_df$raw_p_lab,
+    check.names = FALSE
+  ),
+  rows = NULL,
+  theme = ttheme_minimal(
+    core    = list(fg_params = list(hjust = 0, x = 0)),
+    colhead = list(fg_params = list(hjust = 0, x = 0))
+  )
+)
+
+# adj OR + adj p
+og <- tableGrob(
+  data.frame(
+    `adj OR` = sprintf("%.2f", forest_df$adjOR),
+    `adj p`  = forest_df$adj_p_lab,
+    check.names = FALSE
+  ),
+  rows = NULL,
+  theme = ttheme_minimal(
+    core    = list(fg_params = list(hjust = 0, x = 0)),
+    colhead = list(fg_params = list(hjust = 0, x = 0))
+  )
+)
+
+# Covariates only
+pg <- tableGrob(
+  forest_df %>% transmute(Covariates),
+  rows = NULL,
+  theme = ttheme_minimal(
+    core    = list(fg_params = list(hjust = 0, x = 0)),
+    colhead = list(fg_params = list(hjust = 0, x = 0))
+  )
+)
+
+# ---- Forest plot ----
+fp <- ggplot(forest_df, aes(y = Outcome)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+
+  geom_errorbar(aes(xmin = adj_L, xmax = adj_U),
+                width = 0.22, linewidth = 0.8, colour = "brown",
+                position = position_nudge(y = -0.10),
+                orientation = "y") +
+  geom_point(aes(x = adjOR),
+             size = 3, colour = "brown",
+             position = position_nudge(y = -0.10)) +
+
+  geom_errorbar(aes(xmin = raw_L, xmax = raw_U),
+                width = 0.22, linewidth = 0.8, colour = "black",
+                position = position_nudge(y = 0.10),
+                orientation = "y") +
+  geom_point(aes(x = rawOR),
+             size = 3, colour = "black",
+             position = position_nudge(y = 0.10)) +
+
+  scale_x_log10(breaks = c(0.2, 1, 2, 4, 8), limits = c(0.2, 8)) +
+  scale_y_discrete(limits = rev(levels(forest_df$Outcome))) +
+  labs(x = "OR (95% CI) for Tropism (X4 vs R5)", y = NULL) +
+  theme_minimal(base_size = 16) +
+  theme(panel.grid.minor = element_blank())
+
+# ---- Assemble and save (ORDERED) ----
+combined <- plot_grid(
+  tg, rg, og, fp, pg,
+  ncol       = 5,
+  rel_widths = c(0.06, 0.02, 0.04, 0.12, 0.1),
+  align      = "v"
+)
+
+print(combined)
+
+pdf_name <- paste0("Forest_Selected_Outcomes_Unadj_vs_Adj_RiskFactors", ts, ".pdf")
+
+ggsave(
+  filename = pdf_name,
+  plot     = combined,
+  width    = 28,
+  height   = 10
+)
+```
+
+
+#ORs_Logistic regression (with CD4_Nadir sensitivity)
+```{r}
+
+# ===================== SETUP =====================
+setwd(file.path(base_out, "ORs"))
+
+df <- df_raw %>% prep_r5x4() %>% add_derived_cols()
+
+# ---- Outcomes -> covariates map (CD4_NADIR added to ALL outcomes) ----
+var_covs <- list(
+  "CDC3"                    = c("AGE","SEX_BIRTH","TIMETOCART"),
+  "OPP_AIDS_DEF"            = c("AGE","SEX_BIRTH","TIMETOCART"),
+  "OTHER_AIDS_DEF"          = c("AGE","SEX_BIRTH","TIMETOCART"),
+  "INR_Willem"              = c("AGE","SEX_BIRTH","CD4_NADIR"),
+  "MH_PSY_D.Other"          = c("AGE","SEX_BIRTH","TIMETOCART","CD4_NADIR"),
+  "MED_PSY.Antipsychotics"  = c("AGE","SEX_BIRTH","TIMETOCART","CD4_NADIR"),
+  "MED_PSY.Benzodiazepines" = c("AGE","SEX_BIRTH","TIMETOCART","CD4_NADIR"),
+  "MH_TR_END_D.DM2"         = c("AGE","SEX_BIRTH","TIMETOCART","BMI_BASELINE","SMOKING_CURRENT","CD4_NADIR"),
+  "Plaque"                  = c("AGE","HT","SEX_BIRTH","TIMETOCART","DM","HC","BMI_BASELINE","SMOKING_CURRENT","CD4_NADIR"),
+  "MALIG_NONAIDS"           = c("AGE","SEX_BIRTH","TIMETOCART","SMOKING_CURRENT","ALCOHOL_UNITS_WEEK","CD4_NADIR"),
+  "CVD_baseline"            = c("AGE","SEX_BIRTH","TIMETOCART","BMI_BASELINE","HT","HC","DM","SMOKING_CURRENT","CD4_NADIR"),
+  "Steatosis_yesno"         = c("AGE","SEX_BIRTH","TIMETOCART","BMI_BASELINE","HT","HC","DM","SMOKING_CURRENT","CD4_NADIR"),
+  "hi_vs_rest"              = c("AGE","SEX_BIRTH","TIMETOCART","CD4_NADIR")
+)
+
+
+# ===================== LINEARITY CHECKS =====================
+library(splines)
+
+check_linearity_one <- function(df, y, covs, var = c("AGE","BMI_BASELINE","CD4_NADIR"), df_spline = 3) {
+  var <- match.arg(var)
+
+  cols <- unique(c(y, "Tropism", covs))
+  d <- df %>%
+    select(any_of(cols)) %>%
+    mutate("{y}" := coerce_binary01(.data[[y]])) %>%
+    filter(!is.na(.data[[y]])) %>%
+    na.omit()
+
+  if (nrow(d) < 50) return(NULL)
+  if (!all(sort(unique(d[[y]])) %in% c(0, 1))) return(NULL)
+  if (length(unique(d$Tropism)) < 2) return(NULL)
+  if (!var %in% names(d)) return(NULL)
+  if (all(is.na(d[[var]]))) return(NULL)
+  if (length(unique(d[[var]])) < 5) return(NULL)
+
+  rhs_lin <- paste(c("Tropism", covs), collapse = " + ")
+  f_lin   <- as.formula(sprintf("`%s` ~ %s", y, rhs_lin))
+  m_lin   <- suppressWarnings(glm(f_lin, data = d, family = binomial))
+
+  covs_spl <- covs
+  covs_spl[covs_spl == var] <- sprintf("ns(%s, df=%d)", var, df_spline)
+  rhs_spl <- paste(c("Tropism", covs_spl), collapse = " + ")
+  f_spl   <- as.formula(sprintf("`%s` ~ %s", y, rhs_spl))
+  m_spl   <- suppressWarnings(glm(f_spl, data = d, family = binomial))
+
+  lrt <- anova(m_lin, m_spl, test = "LRT")
+
+  tibble(
+    Outcome    = y,
+    Variable   = var,
+    LRT_p      = lrt$`Pr(>Chi)`[2],
+    AIC_linear = AIC(m_lin),
+    AIC_spline = AIC(m_spl),
+    N          = nrow(d)
+  )
+}
+
+lin_checks <- purrr::imap_dfr(var_covs, function(covs, y) {
+  bind_rows(
+    if ("AGE" %in% covs)          check_linearity_one(df, y, covs, var = "AGE") else NULL,
+    if ("BMI_BASELINE" %in% covs) check_linearity_one(df, y, covs, var = "BMI_BASELINE") else NULL,
+    if ("CD4_NADIR" %in% covs)    check_linearity_one(df, y, covs, var = "CD4_NADIR") else NULL
+  )
+})
+
+lin_checks <- lin_checks %>% arrange(LRT_p)
+
+timestamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
+write.xlsx(lin_checks, paste0("Linearity_checks_splines_CD4NADIR_all_", timestamp, ".xlsx"))
+
+lin_checks
+
+# ===================== LOGISTIC MODELS + FOREST PLOT =====================
+
+# ---- Fit function: Unadjusted + Adjusted rows with counts ----
+fit_unadj_adj <- function(y, covs) {
+
+  # ---------------- Unadjusted ----------------
+  d_u <- df %>%
+    select(all_of(c(y, "Tropism"))) %>%
+    mutate("{y}" := coerce_binary01(.data[[y]])) %>%
+    filter(!is.na(.data[[y]])) %>%
+    na.omit()
+
+  if (!all(sort(unique(d_u[[y]])) %in% c(0, 1))) return(NULL)
+  if (length(unique(d_u$Tropism)) < 2) return(NULL)
+
+  N_R5_u  <- sum(d_u$Tropism == "R5")
+  N_X4_u  <- sum(d_u$Tropism == "X4")
+  Ev_R5_u <- sum(d_u[[y]] == 1 & d_u$Tropism == "R5")
+  Ev_X4_u <- sum(d_u[[y]] == 1 & d_u$Tropism == "X4")
+
+  f0 <- as.formula(sprintf("`%s` ~ Tropism", y))
+  m0 <- suppressWarnings(glm(f0, data = d_u, family = binomial))
+  co0 <- summary(m0)$coefficients
+  if (!"TropismX4" %in% rownames(co0)) return(NULL)
+
+  b0  <- co0["TropismX4", "Estimate"]
+  se0 <- co0["TropismX4", "Std. Error"]
+  p0  <- co0["TropismX4", "Pr(>|z|)"]
+
+  # ---------------- Adjusted ----------------
+  cols_a <- unique(c(y, "Tropism", covs))
+  d_a <- df %>%
+    select(any_of(cols_a)) %>%
+    mutate("{y}" := coerce_binary01(.data[[y]])) %>%
+    filter(!is.na(.data[[y]])) %>%
+    na.omit()
+
+  if (!all(sort(unique(d_a[[y]])) %in% c(0, 1))) return(NULL)
+  if (length(unique(d_a$Tropism)) < 2) return(NULL)
+
+  N_R5_a  <- sum(d_a$Tropism == "R5")
+  N_X4_a  <- sum(d_a$Tropism == "X4")
+  Ev_R5_a <- sum(d_a[[y]] == 1 & d_a$Tropism == "R5")
+  Ev_X4_a <- sum(d_a[[y]] == 1 & d_a$Tropism == "X4")
+
+  rhs <- paste(c("Tropism", covs), collapse = " + ")
+  f1  <- as.formula(sprintf("`%s` ~ %s", y, rhs))
+  m1  <- suppressWarnings(glm(f1, data = d_a, family = binomial))
+  co1 <- summary(m1)$coefficients
+  if (!"TropismX4" %in% rownames(co1)) return(NULL)
+
+  b1  <- co1["TropismX4", "Estimate"]
+  se1 <- co1["TropismX4", "Std. Error"]
+  p1  <- co1["TropismX4", "Pr(>|z|)"]
+
+  tibble(
+    Outcome    = y,
+    Model      = c("Unadjusted", "Adjusted"),
+    OR         = exp(c(b0, b1)),
+    CI_Lower   = exp(c(b0 - 1.96 * se0, b1 - 1.96 * se1)),
+    CI_Upper   = exp(c(b0 + 1.96 * se0, b1 + 1.96 * se1)),
+    PValue     = c(p0, p1),
+    Covariates = c("none", paste(covs, collapse = ", ")),
+    N_R5       = c(N_R5_u, N_R5_a),
+    N_X4       = c(N_X4_u, N_X4_a),
+    Events_R5  = c(Ev_R5_u, Ev_R5_a),
+    Events_X4  = c(Ev_X4_u, Ev_X4_a)
+  )
+}
+
+# ---- Run models across outcomes ----
+res <- purrr::imap_dfr(var_covs, ~ fit_unadj_adj(.y, .x)) %>%
+  mutate(
+    Outcome = factor(Outcome, levels = names(var_covs)),
+    Pct_X4  = ifelse(N_X4 > 0, 100 * Events_X4 / N_X4, NA_real_),
+    Pct_R5  = ifelse(N_R5 > 0, 100 * Events_R5 / N_R5, NA_real_)
+  )
+
+# ---- Save results to Excel ----
+ts <- format(as.POSIXct(Sys.time(), tz = "Europe/Brussels"), "%Y%m%d_%H%M%S")
+xlsx_name <- paste0("Outcomes_Unadj_vs_Adj_CD4NADIR_all_", ts, ".xlsx")
+
+wb <- createWorkbook()
+addWorksheet(wb, "Results_Unadj_Adj_withCounts")
+writeData(wb, "Results_Unadj_Adj_withCounts", res)
+saveWorkbook(wb, xlsx_name, overwrite = TRUE)
+
+# ---- Build forest table ----
+adj <- res %>%
+  filter(Model == "Adjusted") %>%
+  transmute(
+    Outcome,
+    adjOR = OR, adj_L = CI_Lower, adj_U = CI_Upper,
+    adj_p = PValue,
+    Covariates,
+    N_R5 = N_R5, N_X4 = N_X4, Ev_R5 = Events_R5, Ev_X4 = Events_X4
+  )
+
+raw <- res %>%
+  filter(Model == "Unadjusted") %>%
+  transmute(
+    Outcome,
+    rawOR = OR, raw_L = CI_Lower, raw_U = CI_Upper,
+    raw_p = PValue
+  )
+
+forest_df <- left_join(adj, raw, by = "Outcome") %>%
+  mutate(
+    Outcome   = factor(Outcome, levels = names(var_covs)),
+    raw_p_lab = fmt_p(raw_p),
+    adj_p_lab = fmt_p(adj_p),
+    Pct_X4    = ifelse(N_X4 > 0, 100 * Ev_X4 / N_X4, NA_real_),
+    Pct_R5    = ifelse(N_R5 > 0, 100 * Ev_R5 / N_R5, NA_real_)
+  ) %>%
+  arrange(Outcome)
+
+# ---- Tables ----
+counts_tbl <- forest_df %>%
+  transmute(
+    Outcome   = as.character(Outcome),
+    `R5 n(%)` = ifelse(is.na(Ev_R5) | is.na(Pct_R5), "",
+                       paste0(Ev_R5, " (", round(Pct_R5), "%)")),
+    `X4 n(%)` = ifelse(is.na(Ev_X4) | is.na(Pct_X4), "",
+                       paste0(Ev_X4, " (", round(Pct_X4), "%)"))
+  )
+
+tg <- tableGrob(
+  counts_tbl, rows = NULL,
+  theme = ttheme_minimal(
+    core    = list(fg_params = list(hjust = 0, x = 0)),
+    colhead = list(fg_params = list(hjust = 0, x = 0))
+  )
+)
+
+rg <- tableGrob(
+  data.frame(
+    `raw OR` = sprintf("%.2f", forest_df$rawOR),
+    `raw p`  = forest_df$raw_p_lab,
+    check.names = FALSE
+  ),
+  rows = NULL,
+  theme = ttheme_minimal(
+    core    = list(fg_params = list(hjust = 0, x = 0)),
+    colhead = list(fg_params = list(hjust = 0, x = 0))
+  )
+)
+
+og <- tableGrob(
+  data.frame(
+    `adj OR` = sprintf("%.2f", forest_df$adjOR),
+    `adj p`  = forest_df$adj_p_lab,
+    check.names = FALSE
+  ),
+  rows = NULL,
+  theme = ttheme_minimal(
+    core    = list(fg_params = list(hjust = 0, x = 0)),
+    colhead = list(fg_params = list(hjust = 0, x = 0))
+  )
+)
+
+pg <- tableGrob(
+  forest_df %>% transmute(Covariates),
+  rows = NULL,
+  theme = ttheme_minimal(
+    core    = list(fg_params = list(hjust = 0, x = 0)),
+    colhead = list(fg_params = list(hjust = 0, x = 0))
+  )
+)
+
+# ---- Forest plot ----
+fp <- ggplot(forest_df, aes(y = Outcome)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+  geom_errorbar(
+    aes(xmin = adj_L, xmax = adj_U),
+    width = 0.22, linewidth = 0.8, colour = "brown",
+    position = position_nudge(y = -0.10),
+    orientation = "y"
+  ) +
+  geom_point(
+    aes(x = adjOR),
+    size = 3, colour = "brown",
+    position = position_nudge(y = -0.10)
+  ) +
+  geom_errorbar(
+    aes(xmin = raw_L, xmax = raw_U),
+    width = 0.22, linewidth = 0.8, colour = "black",
+    position = position_nudge(y = 0.10),
+    orientation = "y"
+  ) +
+  geom_point(
+    aes(x = rawOR),
+    size = 3, colour = "black",
+    position = position_nudge(y = 0.10)
+  ) +
+  scale_x_log10(breaks = c(0.2, 1, 2, 4, 8), limits = c(0.2, 8)) +
+  scale_y_discrete(limits = rev(levels(forest_df$Outcome))) +
+  labs(x = "OR (95% CI) for Tropism (X4 vs R5)", y = NULL) +
+  theme_minimal(base_size = 16) +
+  theme(panel.grid.minor = element_blank())
+
+# ---- Assemble and save ----
+combined <- plot_grid(
+  tg, rg, og, fp, pg,
+  ncol       = 5,
+  rel_widths = c(0.06, 0.02, 0.04, 0.12, 0.10),
+  align      = "v"
+)
+
+print(combined)
+
+pdf_name <- paste0("Forest_Selected_Outcomes_Unadj_vs_Adj_CD4NADIR_all_", ts, ".pdf")
+
+ggsave(
+  filename = pdf_name,
+  plot     = combined,
+  width    = 28,
+  height   = 10
+)
+```
+#interaction check CD4_nadir
+```{r}
+# ============================================================
+# FULL SCRIPT: Tropism * CD4_NADIR interaction checks
+# + Excel output with:
+#   (1) Interaction test results
+#   (2) Explicit main-effects + interaction model formulas per outcome
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(tibble)
+  library(ggplot2)
+  library(openxlsx)
+})
+
+# -----------------------------
+# Helpers (assumed to exist in your pipeline)
+# -----------------------------
+# df_raw
+# prep_r5x4()
+# add_derived_cols()
+# coerce_binary01()
+# var_covs (named list: outcome -> vector of covariates)
+
+# ============================================================
+# Interaction check for ONE outcome: Tropism * interact_var
+# Uses LRT (nested model) + Wald p-value for interaction term(s)
+# ============================================================
+
+interaction_check_one <- function(df, outcome, covs, interact_var,
+                                  family = binomial, min_n = 50) {
+
+  # Only test if interact_var is in covariates for that outcome
+  if (!interact_var %in% covs) return(NULL)
+  if (!outcome %in% names(df)) return(NULL)
+  if (!all(c("Tropism", interact_var) %in% names(df))) return(NULL)
+
+  cols_use <- unique(c(outcome, "Tropism", covs))
+
+  d <- df %>%
+    dplyr::select(dplyr::any_of(cols_use)) %>%
+    dplyr::mutate("{outcome}" := coerce_binary01(.data[[outcome]])) %>%
+    dplyr::filter(!is.na(.data[[outcome]])) %>%
+    tidyr::drop_na()
+
+  # basic checks
+  if (nrow(d) < min_n) return(NULL)
+  if (length(unique(d$Tropism)) < 2) return(NULL)
+  if (!all(sort(unique(d[[outcome]])) %in% c(0, 1))) return(NULL)
+  if (length(unique(d[[interact_var]])) < 2) return(NULL)
+
+  # If interact_var is categorical, require >=2 levels after filtering
+  if (is.character(d[[interact_var]]) || is.factor(d[[interact_var]])) {
+    if (length(unique(d[[interact_var]])) < 2) return(NULL)
+  }
+
+  # -------------------------
+  # Main-effects model: Outcome ~ Tropism + covariates
+  # -------------------------
+  rhs_main <- paste(c("Tropism", covs), collapse = " + ")
+  f_main   <- as.formula(sprintf("`%s` ~ %s", outcome, rhs_main))
+  m_main   <- suppressWarnings(glm(f_main, data = d, family = family))
+
+  # -------------------------
+  # Interaction model: replace interact_var with Tropism*interact_var
+  # Outcome ~ Tropism + covariates + Tropism*interact_var
+  # -------------------------
+  covs_int <- covs
+  covs_int[covs_int == interact_var] <- paste0("Tropism*", interact_var)
+
+  rhs_int <- paste(c("Tropism", covs_int[covs_int != "Tropism"]), collapse = " + ")
+  f_int   <- as.formula(sprintf("`%s` ~ %s", outcome, rhs_int))
+  m_int   <- suppressWarnings(glm(f_int, data = d, family = family))
+
+  # -------------------------
+  # Likelihood ratio test: does interaction improve fit?
+  # -------------------------
+  lrt <- anova(m_main, m_int, test = "LRT")
+  lrt_p <- lrt$`Pr(>Chi)`[2]
+
+  # -------------------------
+  # Wald p-value(s) for interaction term(s)
+  # (handles common naming: TropismX4:CD4_NADIR or CD4_NADIR:TropismX4)
+  # -------------------------
+  co <- summary(m_int)$coefficients
+  int_rows <- grep(
+    paste0("^TropismX4:", interact_var, "|^", interact_var, ":TropismX4$"),
+    rownames(co),
+    value = TRUE
+  )
+  wald_p <- if (length(int_rows) == 0) NA_real_ else max(co[int_rows, "Pr(>|z|)"], na.rm = TRUE)
+
+  tibble::tibble(
+    Outcome        = outcome,
+    InteractionVar = interact_var,
+    N              = nrow(d),
+    LRT_p          = lrt_p,
+    Wald_p_max     = wald_p,
+    AIC_main       = AIC(m_main),
+    AIC_int        = AIC(m_int)
+  )
+}
+
+# ============================================================
+# Build a table of model formulas for each outcome
+# ============================================================
+
+make_model_formula_table <- function(var_covs, interact_var = "CD4_NADIR") {
+
+  purrr::imap_dfr(var_covs, function(covs, outcome) {
+
+    if (!interact_var %in% covs) return(NULL)
+
+    covs <- unique(covs)
+
+    # Main model formula text
+    rhs_main <- paste(c("Tropism", covs), collapse = " + ")
+    f_main_txt <- sprintf("%s ~ %s", outcome, rhs_main)
+
+    # Interaction model formula text
+    covs_int <- covs
+    covs_int[covs_int == interact_var] <- paste0("Tropism*", interact_var)
+    rhs_int <- paste(c("Tropism", covs_int[covs_int != "Tropism"]), collapse = " + ")
+    f_int_txt <- sprintf("%s ~ %s", outcome, rhs_int)
+
+    # Expected interaction coefficient name (useful for reviewer clarity)
+    expected_term <- paste0("TropismX4:", interact_var)
+
+    tibble::tibble(
+      Outcome = outcome,
+      InteractionVar = interact_var,
+      MainEffectsModel = f_main_txt,
+      InteractionModel = f_int_txt,
+      ExpectedInteractionTerm = expected_term
+    )
+  })
+}
+
+# ============================================================
+# Plot predicted probabilities for ONE outcome (if needed)
+# ============================================================
+
+plot_interaction_pred <- function(df, outcome, covs, interact_var = "CD4_NADIR") {
+
+  cols_use <- unique(c(outcome, "Tropism", covs))
+  d <- df %>%
+    dplyr::select(dplyr::any_of(cols_use)) %>%
+    dplyr::mutate("{outcome}" := coerce_binary01(.data[[outcome]])) %>%
+    dplyr::filter(!is.na(.data[[outcome]])) %>%
+    tidyr::drop_na()
+
+  # Fit interaction model
+  covs_int <- covs
+  covs_int[covs_int == interact_var] <- paste0("Tropism*", interact_var)
+  rhs_int <- paste(c("Tropism", covs_int[covs_int != "Tropism"]), collapse = " + ")
+  f_int   <- as.formula(sprintf("`%s` ~ %s", outcome, rhs_int))
+  m_int   <- suppressWarnings(glm(f_int, data = d, family = binomial))
+
+  # Newdata grid: vary interact_var; hold other covariates at typical values
+  grid <- expand.grid(
+    Tropism = factor(c("R5", "X4"), levels = c("R5", "X4")),
+    x       = seq(min(d[[interact_var]], na.rm = TRUE),
+                  max(d[[interact_var]], na.rm = TRUE),
+                  length.out = 100)
+  )
+  names(grid)[names(grid) == "x"] <- interact_var
+
+  # Set other covariates to medians / most frequent levels
+  other_covs <- setdiff(covs, interact_var)
+  for (v in other_covs) {
+    if (!v %in% names(d)) next
+    if (is.numeric(d[[v]])) {
+      grid[[v]] <- stats::median(d[[v]], na.rm = TRUE)
+    } else {
+      tab <- sort(table(d[[v]]), decreasing = TRUE)
+      grid[[v]] <- names(tab)[1]
+      if (is.factor(d[[v]])) {
+        grid[[v]] <- factor(grid[[v]], levels = levels(d[[v]]))
+      }
+    }
+  }
+
+  grid$pred <- predict(m_int, newdata = grid, type = "response")
+
+  ggplot2::ggplot(grid, ggplot2::aes(x = .data[[interact_var]], y = pred, color = Tropism)) +
+    ggplot2::geom_line(linewidth = 1) +
+    ggplot2::theme_minimal() +
+    ggplot2::labs(
+      title = paste0("Predicted probability: ", outcome),
+      x = interact_var,
+      y = "Predicted probability"
+    )
+}
+
+# ============================================================
+# RUN
+# ============================================================
+
+# Prepare analysis dataframe
+df <- df_raw %>% prep_r5x4() %>% add_derived_cols()
+
+# Choose interaction variable
+interact_var <- "CD4_NADIR"
+
+# 1) Interaction tests across all outcomes
+interaction_results <- purrr::imap_dfr(var_covs, function(covs, outcome) {
+  interaction_check_one(df, outcome, covs, interact_var = interact_var)
+}) %>%
+  dplyr::arrange(LRT_p)
+
+# 2) Table of explicit model formulas per outcome
+model_formula_table <- make_model_formula_table(var_covs, interact_var = interact_var)
+
+# Preview in R
+print(interaction_results)
+print(model_formula_table)
+
+# ============================================================
+# EXPORT TO EXCEL: two sheets in one workbook
+# ============================================================
+
+out_xlsx <- paste0(
+  "InteractionChecks_TropismX_", interact_var, "_",
+  format(Sys.time(), "%Y%m%d_%H%M%S"),
+  ".xlsx"
+)
+
+wb <- openxlsx::createWorkbook()
+
+openxlsx::addWorksheet(wb, "InteractionTests")
+openxlsx::writeData(wb, "InteractionTests", interaction_results)
+
+openxlsx::addWorksheet(wb, "ModelFormulas")
+openxlsx::writeData(wb, "ModelFormulas", model_formula_table)
+
+openxlsx::saveWorkbook(wb, out_xlsx, overwrite = TRUE)
+
+message("Saved: ", out_xlsx)
+```
+
+
+#post2014 and infection date known subset_supplementary Figure 2(A)
+```{r}
+setwd(file.path(base_out, "ORs"))
+
+# ---- Base data (from setup) ----
+df_base <- df_raw %>% prep_r5x4() %>% add_derived_cols()
+
+# ---- Subset makers ----
+make_post2014 <- function(df) {
+  if (!"HIV_DATE" %in% names(df)) stop("Column 'HIV_DATE' not found for POST2014.")
+  if (inherits(df$HIV_DATE, "Date")) {
+    df %>%
+      mutate(HIV_YEAR = as.integer(format(HIV_DATE, "%Y"))) %>%
+      filter(!is.na(HIV_YEAR) & HIV_YEAR > 2014)
+  } else {
+    df %>%
+      mutate(HIV_YEAR = suppressWarnings(as.integer(HIV_DATE))) %>%
+      filter(!is.na(HIV_YEAR) & HIV_YEAR > 2014)
+  }
+}
+
+make_inf1y <- function(df) {
+  if (!"INF_date_known_1y" %in% names(df)) stop("'INF_date_known_1y' not found.")
+  df %>% filter(INF_date_known_1y == 1)
+}
+
+# ---- Outcomes & covariates per subset (DIFFERENT) ----
+var_covs_by_subset <- list(
+  POST2014 = list(
+    "INR_Willem"      = c("AGE","SEX_BIRTH","TIMETOCART"),
+    "MH_PSY_D.Other"  = c("AGE","SEX_BIRTH","TIMETOCART"),
+    "hi_vs_rest"      = c("AGE","SEX_BIRTH","TIMETOCART")
+  ),
+  INF_1y = list(
+    "CDC3"            = c("AGE","SEX_BIRTH","TIMETOCART"),
+    "hi_vs_rest"      = c("AGE","SEX_BIRTH","TIMETOCART")
+  )
+)
+
+# ---- Fit on a subset with its own outcomes; return results + forest_df (no plot yet) ----
+fit_on_subset <- function(df_sub, subset_label, var_covs) {
+
+  usable_vars <- names(var_covs)[names(var_covs) %in% names(df_sub)]
+  if (length(usable_vars) == 0) return(list(results = tibble(), forest_df = NULL))
+
+  fit_unadj_adj <- function(y, covs) {
+
+    # Unadjusted
+    d_u <- df_sub %>%
+      select(all_of(c(y, "Tropism"))) %>%
+      mutate("{y}" := coerce_binary01(.data[[y]])) %>%
+      filter(!is.na(.data[[y]])) %>%
+      na.omit()
+
+    if (nrow(d_u) == 0 || !all(sort(unique(d_u[[y]])) %in% c(0,1))) return(NULL)
+    if (length(unique(d_u$Tropism)) < 2) return(NULL)
+
+    N_R5_u  <- sum(d_u$Tropism == "R5")
+    N_X4_u  <- sum(d_u$Tropism == "X4")
+    Ev_R5_u <- sum(d_u[[y]] == 1 & d_u$Tropism == "R5")
+    Ev_X4_u <- sum(d_u[[y]] == 1 & d_u$Tropism == "X4")
+
+    m0 <- suppressWarnings(glm(as.formula(sprintf("`%s` ~ Tropism", y)),
+                               data = d_u, family = binomial))
+    co0 <- summary(m0)$coefficients
+    if (!"TropismX4" %in% rownames(co0)) return(NULL)
+    b0  <- co0["TropismX4","Estimate"]
+    se0 <- co0["TropismX4","Std. Error"]
+    p0  <- co0["TropismX4","Pr(>|z|)"]
+
+    # Adjusted
+    base_covs <- covs %||% character(0)
+    covs_use  <- setdiff(intersect(unique(base_covs), names(df_sub)), "Tropism")
+
+    d_a <- df_sub %>%
+      select(any_of(c(y, "Tropism", covs_use))) %>%
+      mutate("{y}" := coerce_binary01(.data[[y]])) %>%
+      filter(!is.na(.data[[y]])) %>%
+      na.omit()
+
+    if (nrow(d_a) == 0 || length(unique(d_a$Tropism)) < 2) return(NULL)
+
+    N_R5_a  <- sum(d_a$Tropism == "R5")
+    N_X4_a  <- sum(d_a$Tropism == "X4")
+    Ev_R5_a <- sum(d_a[[y]] == 1 & d_a$Tropism == "R5")
+    Ev_X4_a <- sum(d_a[[y]] == 1 & d_a$Tropism == "X4")
+
+    rhs <- if (length(covs_use) > 0) {
+      paste("Tropism", paste(covs_use, collapse = " + "), sep = " + ")
+    } else "Tropism"
+
+    m1 <- suppressWarnings(glm(as.formula(sprintf("`%s` ~ %s", y, rhs)),
+                               data = d_a, family = binomial))
+    co1 <- summary(m1)$coefficients
+    if (!"TropismX4" %in% rownames(co1)) return(NULL)
+    b1  <- co1["TropismX4","Estimate"]
+    se1 <- co1["TropismX4","Std. Error"]
+    p1  <- co1["TropismX4","Pr(>|z|)"]
+
+    tibble(
+      Subset    = subset_label,
+      Outcome   = y,
+      Model     = c("Unadjusted","Adjusted"),
+      OR        = exp(c(b0, b1)),
+      CI_Lower  = exp(c(b0 - 1.96*se0, b1 - 1.96*se1)),
+      CI_Upper  = exp(c(b0 + 1.96*se0, b1 + 1.96*se1)),
+      PValue    = c(p0, p1),
+      Covariates= c("none", paste(covs_use, collapse = ", ")),
+      N_R5      = c(N_R5_u, N_R5_a),
+      N_X4      = c(N_X4_u, N_X4_a),
+      Events_R5 = c(Ev_R5_u, Ev_R5_a),
+      Events_X4 = c(Ev_X4_u, Ev_X4_a)
+    )
+  }
+
+  res <- purrr::imap_dfr(var_covs[usable_vars], ~fit_unadj_adj(.y, .x))
+  if (nrow(res) == 0) return(list(results = tibble(), forest_df = NULL))
+
+  outcome_levels <- names(var_covs)[names(var_covs) %in% usable_vars]
+
+  adj <- res %>%
+    filter(Model == "Adjusted") %>%
+    transmute(
+      Outcome,
+      adjOR = OR, adj_L = CI_Lower, adj_U = CI_Upper,
+      adj_p = PValue,
+      Covariates, N_R5, N_X4, Ev_R5 = Events_R5, Ev_X4 = Events_X4
+    )
+
+  raw <- res %>%
+    filter(Model == "Unadjusted") %>%
+    transmute(Outcome, rawOR = OR, raw_L = CI_Lower, raw_U = CI_Upper, raw_p = PValue)
+
+  forest_df <- left_join(adj, raw, by = "Outcome") %>%
+    mutate(
+      Outcome   = factor(Outcome, levels = outcome_levels),
+      raw_p_lab = fmt_p(raw_p),
+      adj_p_lab = fmt_p(adj_p),
+      Pct_X4    = ifelse(N_X4 > 0, 100 * Ev_X4 / N_X4, NA_real_),
+      Pct_R5    = ifelse(N_R5 > 0, 100 * Ev_R5 / N_R5, NA_real_)
+    ) %>%
+    arrange(Outcome)
+
+  list(results = res, forest_df = forest_df)
+}
+
+# ---- Build subsets ----
+df_post2014 <- make_post2014(df_base)
+df_inf1y    <- make_inf1y(df_base)
+
+out_post2014 <- fit_on_subset(df_post2014, "POST2014", var_covs_by_subset$POST2014)
+out_inf1y    <- fit_on_subset(df_inf1y,    "INF_1y",   var_covs_by_subset$INF_1y)
+
+# ---- Compute COMMON auto x-range across both panels ----
+get_limits_from_forest <- function(fdf) {
+  if (is.null(fdf) || nrow(fdf) == 0) return(c(NA_real_, NA_real_))
+  lo <- suppressWarnings(min(c(fdf$adj_L, fdf$raw_L), na.rm = TRUE))
+  hi <- suppressWarnings(max(c(fdf$adj_U, fdf$raw_U), na.rm = TRUE))
+  c(lo, hi)
+}
+
+lim1 <- get_limits_from_forest(out_post2014$forest_df)
+lim2 <- get_limits_from_forest(out_inf1y$forest_df)
+lims_all <- range(c(lim1, lim2), na.rm = TRUE)
+
+if (is.finite(lims_all[1]) && is.finite(lims_all[2]) && lims_all[1] > 0) {
+  pad <- 0.06
+  log_lo <- log(lims_all[1]); log_hi <- log(lims_all[2])
+  span <- log_hi - log_lo
+  log_lo <- log_lo - pad * span
+  log_hi <- log_hi + pad * span
+  x_limits <- c(exp(log_lo), exp(log_hi))
+  if (x_limits[1] >= 1) x_limits[1] <- 1/exp(0.5)
+  if (x_limits[2] <= 1) x_limits[2] <- exp(0.5)
+} else {
+  x_limits <- c(0.2, 8)
+}
+
+x_breaks <- scales::log_breaks(n = 5)(x_limits)
+
+# ---- Panel builder using SHARED limits/breaks ----
+build_forest_panel <- function(forest_df, subset_label, x_limits, x_breaks) {
+  if (is.null(forest_df) || nrow(forest_df) == 0) return(NULL)
+
+  counts_tbl <- forest_df %>%
+    transmute(
+      Outcome = as.character(Outcome),
+      `X4 n(%)` = ifelse(is.na(Ev_X4) | is.na(Pct_X4), "",
+                        paste0(Ev_X4, " (", round(Pct_X4), "%)")),
+      `R5 n(%)` = ifelse(is.na(Ev_R5) | is.na(Pct_R5), "",
+                        paste0(Ev_R5, " (", round(Pct_R5), "%)"))
+    )
+
+  tg <- tableGrob(counts_tbl, rows = NULL,
+                  theme = ttheme_minimal(core=list(fg_params=list(hjust=0, x=0)),
+                                         colhead=list(fg_params=list(hjust=0, x=0))))
+  og <- tableGrob(data.frame(`adj OR` = sprintf("%.2f", forest_df$adjOR), check.names = FALSE),
+                  rows = NULL,
+                  theme = ttheme_minimal(core=list(fg_params=list(hjust=0, x=0)),
+                                         colhead=list(fg_params=list(hjust=0, x=0))))
+  rg <- tableGrob(data.frame(`raw OR` = sprintf("%.2f", forest_df$rawOR),
+                             `raw p`  = forest_df$raw_p_lab, check.names = FALSE),
+                  rows = NULL,
+                  theme = ttheme_minimal(core=list(fg_params=list(hjust=0, x=0)),
+                                         colhead=list(fg_params=list(hjust=0, x=0))))
+  pg <- tableGrob(forest_df %>% transmute(`adj p` = adj_p_lab, Covariates),
+                  rows = NULL,
+                  theme = ttheme_minimal(core=list(fg_params=list(hjust=0, x=0)),
+                                         colhead=list(fg_params=list(hjust=0, x=0))))
+
+  fp <- ggplot(forest_df, aes(y = Outcome)) +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+    geom_errorbar(aes(xmin = adj_L, xmax = adj_U),
+                  width = 0.22, linewidth = 0.8, colour = "brown",
+                  position = position_nudge(y = -0.15),
+                  orientation = "y") +
+    geom_point(aes(x = adjOR), size = 3, colour = "brown",
+               position = position_nudge(y = -0.15)) +
+    geom_errorbar(aes(xmin = raw_L, xmax = raw_U),
+                  width = 0.22, linewidth = 0.8, colour = "black",
+                  position = position_nudge(y = 0.15),
+                  orientation = "y") +
+    geom_point(aes(x = rawOR), size = 3, colour = "black",
+               position = position_nudge(y = 0.15)) +
+    scale_x_log10(breaks = x_breaks, limits = x_limits) +
+    scale_y_discrete(limits = rev(levels(forest_df$Outcome))) +
+    labs(x = paste0("OR (95% CI) X4 vs R5 — ", subset_label), y = NULL) +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid.minor = element_blank())
+
+  plot_grid(tg, og, rg, fp, pg,
+            ncol = 5, rel_widths = c(0.28, 0.10, 0.12, 0.35, 0.15),
+            align = "v")
+}
+
+panel_post2014 <- build_forest_panel(out_post2014$forest_df, "POST2014", x_limits, x_breaks)
+panel_inf1y    <- build_forest_panel(out_inf1y$forest_df,    "INF_1y",   x_limits, x_breaks)
+
+# ---- ONE Excel (per-subset sheets + Combined) ----
+wb <- createWorkbook()
+if (!is.null(out_post2014$results) && nrow(out_post2014$results) > 0) {
+  addWorksheet(wb, "POST2014"); writeData(wb, "POST2014", out_post2014$results)
+}
+if (!is.null(out_inf1y$results) && nrow(out_inf1y$results) > 0) {
+  addWorksheet(wb, "INF_1y");   writeData(wb, "INF_1y",   out_inf1y$results)
+}
+combined_results <- bind_rows(out_post2014$results, out_inf1y$results)
+if (nrow(combined_results) > 0) {
+  addWorksheet(wb, "Combined"); writeData(wb, "Combined", combined_results)
+}
+saveWorkbook(wb, "Outcomes_post2014_infectionDateKnown2.xlsx", overwrite = TRUE)
+
+# ---- ONE PDF (both panels stacked; shared x-axis) ----
+plots_to_stack <- list(panel_post2014, panel_inf1y)
+plots_to_stack <- plots_to_stack[!vapply(plots_to_stack, is.null, logical(1))]
+
+both <- plot_grid(panel_post2014, panel_inf1y, ncol = 1, rel_heights = c(1, 1))
+ggsave("Forest_post2014_infectionDateKnown2.pdf", both, width = 30, height = 8)
+```
+
+
+# 2-years outcome (follow-up timepoint)
+```{r}
+# ---- ORs_finalplot: 2y outcomes (uses setup chunk objects) ----
+setwd(file.path(base_out, "ORs"))
+
+# Data from setup
+df <- df_raw %>% prep_r5x4() %>% add_derived_cols()
+
+# Derived columns specific to this chunk
+df <- df %>%
+  mutate(
+    CDC3_INF1y = if_else(HIV_STAGE_CDC == 2 & INF_date_known_1y == 1,
+                         1L, 0L, missing = NA_integer_)
+  )
+
+# Make MALIG_2Y binary: 1 = Malignancy, 0 = No malignancy
+df <- df %>%
+  mutate(
+    `MALIG_2Y#No malignancy past 2 years` = case_when(
+      is.na(`MALIG_2Y#No malignancy past 2 years`) ~ NA_integer_,
+      str_trim(`MALIG_2Y#No malignancy past 2 years`) %in% c("Malignancy","malignancy") ~ 1L,
+      str_trim(`MALIG_2Y#No malignancy past 2 years`) %in% c("No malignancy","no malignancy") ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+# Outcomes -> covariates map
+var_covs <- list(
+  "MH_TR_END_D_2Y#Hypercholesterolemia" = c("AGE","SEX_BIRTH","TIMETOCART","BMI_BASELINE","SMOKING_CURRENT"),
+  "MH_TR_END_D_2Y#DM2"                  = c("AGE","SEX_BIRTH","TIMETOCART","BMI_BASELINE","SMOKING_CURRENT"),
+  "MH_TR_GE_D_2Y#Liversteatosis"        = c("AGE","SEX_BIRTH","TIMETOCART","BMI_BASELINE","SMOKING_CURRENT","HT","DM","HC"),
+  "CVD2y"                               = c("AGE","SEX_BIRTH","TIMETOCART","BMI_BASELINE","SMOKING_CURRENT","HT","DM","HC"),
+  "MALIG_2Y#No malignancy past 2 years" = c("AGE","SEX_BIRTH","TIMETOCART")
+)
+
+# Keep only outcomes that exist
+var_covs <- var_covs[names(var_covs) %in% names(df)]
+if (length(var_covs) == 0L) stop("None of the requested outcomes are present as columns in df.")
+
+# Fit function (kept here; no helper re-definitions)
+fit_unadj_adj <- function(y, covs) {
+
+  # Unadjusted
+  d_u <- df %>%
+    select(all_of(c(y, "Tropism"))) %>%
+    mutate("{y}" := coerce_binary01(.data[[y]])) %>%
+    filter(!is.na(.data[[y]])) %>%
+    na.omit()
+
+  if (!all(sort(unique(d_u[[y]])) %in% c(0,1))) return(NULL)
+  if (length(unique(d_u$Tropism)) < 2) return(NULL)
+
+  N_R5_u  <- sum(d_u$Tropism == "R5")
+  N_X4_u  <- sum(d_u$Tropism == "X4")
+  Ev_R5_u <- sum(d_u[[y]] == 1 & d_u$Tropism == "R5")
+  Ev_X4_u <- sum(d_u[[y]] == 1 & d_u$Tropism == "X4")
+
+  f0 <- as.formula(sprintf("`%s` ~ Tropism", y))
+  m0 <- suppressWarnings(glm(f0, data = d_u, family = binomial))
+  co0 <- summary(m0)$coefficients
+  if (!"TropismX4" %in% rownames(co0)) return(NULL)
+  b0  <- co0["TropismX4","Estimate"]
+  se0 <- co0["TropismX4","Std. Error"]
+  p0  <- co0["TropismX4","Pr(>|z|)"]
+
+  # Adjusted
+  cols_a <- c(y, "Tropism", covs)
+  d_a <- df %>%
+    select(any_of(cols_a)) %>%
+    mutate("{y}" := coerce_binary01(.data[[y]])) %>%
+    filter(!is.na(.data[[y]])) %>%
+    na.omit()
+
+  if (length(unique(d_a$Tropism)) < 2) return(NULL)
+
+  N_R5_a  <- sum(d_a$Tropism == "R5")
+  N_X4_a  <- sum(d_a$Tropism == "X4")
+  Ev_R5_a <- sum(d_a[[y]] == 1 & d_a$Tropism == "R5")
+  Ev_X4_a <- sum(d_a[[y]] == 1 & d_a$Tropism == "X4")
+
+  rhs <- paste(c("Tropism", covs), collapse = " + ")
+  f1  <- as.formula(sprintf("`%s` ~ %s", y, rhs))
+  m1  <- suppressWarnings(glm(f1, data = d_a, family = binomial))
+  co1 <- summary(m1)$coefficients
+  if (!"TropismX4" %in% rownames(co1)) return(NULL)
+  b1  <- co1["TropismX4","Estimate"]
+  se1 <- co1["TropismX4","Std. Error"]
+  p1  <- co1["TropismX4","Pr(>|z|)"]
+
+  tibble(
+    Outcome    = y,
+    Model      = c("Unadjusted","Adjusted"),
+    OR         = exp(c(b0, b1)),
+    CI_Lower   = exp(c(b0 - 1.96*se0, b1 - 1.96*se1)),
+    CI_Upper   = exp(c(b0 + 1.96*se0, b1 + 1.96*se1)),
+    PValue     = c(p0, p1),
+    Covariates = c("none", paste(covs, collapse = ", ")),
+    N_R5       = c(N_R5_u, N_R5_a),
+    N_X4       = c(N_X4_u, N_X4_a),
+    Events_R5  = c(Ev_R5_u, Ev_R5_a),
+    Events_X4  = c(Ev_X4_u, Ev_X4_a)
+  )
+}
+
+# Run models
+res <- purrr::imap_dfr(var_covs, ~fit_unadj_adj(.y, .x)) %>%
+  mutate(Outcome = factor(Outcome, levels = names(var_covs))) %>%
+  mutate(
+    Pct_X4 = ifelse(N_X4 > 0, 100 * Events_X4 / N_X4, NA_real_),
+    Pct_R5 = ifelse(N_R5 > 0, 100 * Events_R5 / N_R5, NA_real_)
+  )
+
+# Save results
+wb <- createWorkbook()
+addWorksheet(wb, "Results_Unadj_Adj_withCounts")
+writeData(wb, "Results_Unadj_Adj_withCounts", res)
+saveWorkbook(wb, "Outcomes_Unadj_vs_Adj_CustomCovs_2y.xlsx", overwrite = TRUE)
+
+# Build forest_df
+adj <- res %>%
+  filter(Model == "Adjusted") %>%
+  transmute(
+    Outcome,
+    adjOR = OR, adj_L = CI_Lower, adj_U = CI_Upper,
+    adj_p = PValue,
+    Covariates,
+    N_R5 = N_R5, N_X4 = N_X4, Ev_R5 = Events_R5, Ev_X4 = Events_X4
+  )
+
+raw <- res %>%
+  filter(Model == "Unadjusted") %>%
+  transmute(
+    Outcome,
+    rawOR = OR, raw_L = CI_Lower, raw_U = CI_Upper,
+    raw_p = PValue
+  )
+
+forest_df <- left_join(adj, raw, by = "Outcome") %>%
+  mutate(
+    Outcome   = factor(Outcome, levels = names(var_covs)),
+    raw_p_lab = fmt_p(raw_p),
+    adj_p_lab = fmt_p(adj_p),
+    Pct_X4    = ifelse(N_X4 > 0, 100 * Ev_X4 / N_X4, NA_real_),
+    Pct_R5    = ifelse(N_R5 > 0, 100 * Ev_R5 / N_R5, NA_real_)
+  ) %>%
+  arrange(Outcome)
+
+# Right-side tables
+counts_tbl <- forest_df %>%
+  transmute(
+    Outcome = as.character(Outcome),
+    `X4 n(%)` = ifelse(is.na(Ev_X4) | is.na(Pct_X4), "",
+                      paste0(Ev_X4, " (", round(Pct_X4), "%)")),
+    `R5 n(%)` = ifelse(is.na(Ev_R5) | is.na(Pct_R5), "",
+                      paste0(Ev_R5, " (", round(Pct_R5), "%)"))
+  )
+
+tg <- tableGrob(counts_tbl, rows = NULL,
+                theme = ttheme_minimal(core=list(fg_params=list(hjust=0, x=0)),
+                                       colhead=list(fg_params=list(hjust=0, x=0))))
+
+og <- tableGrob(data.frame(`adj OR` = sprintf("%.2f", forest_df$adjOR), check.names = FALSE),
+                rows = NULL,
+                theme = ttheme_minimal(core=list(fg_params=list(hjust=0, x=0)),
+                                       colhead=list(fg_params=list(hjust=0, x=0))))
+
+rg <- tableGrob(data.frame(`raw OR` = sprintf("%.2f", forest_df$rawOR),
+                           `raw p`  = forest_df$raw_p_lab,
+                           check.names = FALSE),
+                rows = NULL,
+                theme = ttheme_minimal(core=list(fg_params=list(hjust=0, x=0)),
+                                       colhead=list(fg_params=list(hjust=0, x=0))))
+
+pg <- tableGrob(forest_df %>% transmute(`adj p` = adj_p_lab, Covariates),
+                rows = NULL,
+                theme = ttheme_minimal(core=list(fg_params=list(hjust=0, x=0)),
+                                       colhead=list(fg_params=list(hjust=0, x=0))))
+
+# X-axis clamp + breaks
+lo <- 0.04
+hi <- 9
+cand <- c(0.04, 0.2, 0.5, 1, 3, 6, 9)
+br <- cand[cand >= lo & cand <= hi]
+
+# Forest plot (no geom_errorbarh warning)
+fp <- ggplot(forest_df, aes(y = Outcome)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+  geom_errorbar(aes(xmin = adj_L, xmax = adj_U),
+                width = 0.22, linewidth = 0.8, colour = "brown",
+                position = position_nudge(y = -0.15),
+                orientation = "y") +
+  geom_point(aes(x = adjOR),
+             size = 3, colour = "brown",
+             position = position_nudge(y = -0.15)) +
+  geom_errorbar(aes(xmin = raw_L, xmax = raw_U),
+                width = 0.22, linewidth = 0.8, colour = "black",
+                position = position_nudge(y = 0.15),
+                orientation = "y") +
+  geom_point(aes(x = rawOR),
+             size = 3, colour = "black",
+             position = position_nudge(y = 0.15)) +
+  scale_x_log10(breaks = br, limits = c(lo, hi), minor_breaks = NULL) +
+  scale_y_discrete(limits = rev(levels(forest_df$Outcome))) +
+  labs(x = "OR (95% CI) for Tropism (X4 vs R5)", y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+
+# Assemble and save
+combined <- cowplot::plot_grid(
+  tg, og, rg, fp, pg,
+  ncol       = 5,
+  rel_widths = c(0.28, 0.10, 0.12, 0.35, 0.15),
+  align      = "v"
+)
+
+print(combined)
+
+ggsave(
+  filename = "Forest_Selected_Outcomes_Unadj_vs_Adj_2y.pdf",
+  plot     = combined,
+  width    = 30,
+  height   = 8
+)
+```
+
+
+#Prevalance of variable 
+```{r}
+# ---- Outcome counts/percentages by Tropism (R5/X4/Mixed) + grouped bar plot ----
+# Uses df_raw from setup. Produces:
+# 1) Outcome_Counts_Percentages_ByTropism.xlsx
+# 2) GroupedBar_Outcomes_by_Tropism_Percent.pdf (or Events if you switch y_var)
+
+setwd(file.path(base_out, "ORs"))
+
+# ---- Filter + factor Tropism (INCLUDE Mixed) ----
+df <- df_raw %>%
+  filter(Tropism %in% c("R5","X4","Mixed"),
+         CONTROLLER_1B != "EC_persistent") %>%
+  mutate(Tropism = factor(Tropism, levels = c("R5","X4","Mixed")))
+
+# ---- Derived columns (keep same logic; if your setup already does this, you can delete this block) ----
+df <- df %>%
+  mutate(
+    lo_vs_rest = if_else(ViReTgroup == "LoViReT", 1, 0, missing = NA_real_),
+    hi_vs_rest = if_else(ViReTgroup == "HiViReT", 1, 0, missing = NA_real_),
+    hi_vs_lo   = case_when(
+      ViReTgroup == "HiViReT" ~ 1,
+      ViReTgroup == "LoViReT" ~ 0,
+      TRUE ~ NA_real_
+    ),
+    CDC3 = if_else(HIV_STAGE_CDC == 2, 1L, 0L, missing = NA_integer_)
+  ) %>%
+  mutate(
+    Steatosis_yesno = case_when(
+      is.na(Steatosis_yesno) ~ NA_character_,
+      trimws(Steatosis_yesno) %in% c("S1","S2","S3","S1-S3") ~ "S1-S3",
+      trimws(Steatosis_yesno) == "S0" ~ "S0",
+      TRUE ~ NA_character_
+    ),
+    Steatosis_yesno = factor(Steatosis_yesno, levels = c("S0","S1-S3"))
+  )
+
+# ---- Outcomes list ----
+outcomes <- c(
+  "CDC3",
+  "OPP_AIDS_DEF",
+  "OTHER_AIDS_DEF",
+  "INR_Willem",
+  "Plaque",
+  "MH_TR_END_D.DM2",
+  "MH_PSY_D.Other",
+  "MED_PSY.Antipsychotics",
+  "MED_PSY.Benzodiazepines",
+  "MALIG_NONAIDS",
+  "CVD_baseline",
+  "Steatosis_yesno",
+  "hi_vs_rest"
+)
+
+# ---- Event rules ----
+event_level_map <- list(
+  "Steatosis_yesno" = "S1-S3"
+)
+
+# ---- Helper: counts/percent per Tropism + Overall ----
+summarize_outcome <- function(data, var) {
+  if (!var %in% names(data)) return(NULL)
+
+  v <- data[[var]]
+
+  # Determine event vector
+  if (is.factor(v) || is.character(v)) {
+    if (var %in% names(event_level_map)) {
+      event <- v == event_level_map[[var]]
+    } else {
+      event <- !is.na(v) & !(v %in% c("0","No","None","False","F","S0"))
+    }
+    denom <- !is.na(v)
+  } else {
+    event <- !is.na(v) & (v == 1)
+    denom <- !is.na(v)
+  }
+
+  tmp <- data %>%
+    mutate(.event = event, .denom = denom) %>%
+    group_by(Tropism, .drop = FALSE) %>%
+    summarize(
+      N_non_missing = sum(.denom),
+      Events = sum(.event, na.rm = TRUE),
+      Percent = ifelse(N_non_missing > 0, round(100 * Events / N_non_missing, 1), NA_real_),
+      .groups = "drop"
+    )
+
+  overall <- tmp %>%
+    summarize(
+      Tropism = factor("Overall", levels = c("Overall","R5","X4","Mixed")),
+      N_non_missing = sum(N_non_missing),
+      Events = sum(Events),
+      Percent = ifelse(N_non_missing > 0, round(100 * Events / N_non_missing, 1), NA_real_)
+    )
+
+  bind_rows(
+    overall,
+    tmp %>% mutate(Tropism = factor(as.character(Tropism), levels = c("R5","X4","Mixed")))
+  ) %>%
+    mutate(Outcome = var, .before = 1) %>%
+    select(Outcome, Tropism, N_non_missing, Events, Percent)
+}
+
+# ---- Run for all outcomes and combine ----
+summary_tbl <- purrr::map(outcomes, ~summarize_outcome(df, .x)) %>%
+  purrr::compact() %>%
+  bind_rows() %>%
+  arrange(match(Tropism, c("Overall","R5","X4","Mixed")), Outcome)
+
+print(summary_tbl, n = nrow(summary_tbl))
+
+# ---- Write to Excel ----
+out_xlsx <- file.path(getwd(), "Outcome_Counts_Percentages_ByTropism.xlsx")
+openxlsx::write.xlsx(summary_tbl, out_xlsx, overwrite = TRUE)
+cat("Saved:", out_xlsx, "\n")
+
+# =========================
+# PLOT: grouped bars
+# =========================
+custom_colors <- c("R5" = "aquamarine3", "Mixed" = "steelblue3", "X4" = "coral")
+
+desired_order <- c(
+  "CDC3","CVD_baseline","INR_Willem","MALIG_NONAIDS",
+  "MED_PSY.Antipsychotics","MED_PSY.Benzodiazepines","MH_PSY_D.Other",
+  "MH_TR_END_D.DM2","OPP_AIDS_DEF","OTHER_AIDS_DEF",
+  "Plaque","Steatosis_yesno","hi_vs_rest"
+)
+
+plot_df <- summary_tbl %>%
+  filter(Tropism %in% c("Mixed","X4","R5")) %>%
+  mutate(
+    Outcome = factor(Outcome, levels = rev(desired_order)),
+    Tropism = factor(Tropism, levels = c("Mixed","X4","R5")),
+    label   = ifelse(is.na(Percent), NA_character_,
+                     paste0(Percent, "% (", Events, "/", N_non_missing, ")"))
+  )
+
+y_var <- "Percent"  # change to "Events" if you prefer counts
+
+pd <- position_dodge2(width = 0.8, preserve = "single")
+
+p <- ggplot(plot_df, aes(x = Outcome, y = .data[[y_var]], fill = Tropism)) +
+  geom_col(position = pd, width = 0.7, na.rm = TRUE) +
+  geom_text(
+    aes(y = .data[[y_var]], label = label),
+    position = pd,
+    hjust = 0,
+    vjust = 0.5,
+    size = 3,
+    na.rm = TRUE
+  ) +
+  scale_fill_manual(values = custom_colors) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.10))) +
+  labs(
+    x = NULL,
+    y = ifelse(y_var == "Percent", "Percent with outcome (%)", "Number of events"),
+    fill = "Tropism",
+    title = "Outcome counts/percentages by Tropism"
+  ) +
+  coord_flip(clip = "off") +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0),
+    axis.text.y = element_text(size = 10),
+    legend.position = "top",
+    panel.grid.major.y = element_blank()
+  )
+
+print(p)
+
+ggsave(
+  filename = file.path(getwd(), paste0("GroupedBar_Outcomes_by_Tropism_", y_var, ".pdf")),
+  plot = p,
+  width = 10, height = 12
+)
+
+
+```
+
+
+
