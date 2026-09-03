@@ -1,0 +1,2533 @@
+---
+title: "Olink DEP Analysis_Tropism (R5 vs X4)"
+author: "Kavita Mehta (modified from Vicky's and Victoria's script)"
+date: "2025-09-18"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+This script performs differential protein expression (DEP) analysis comparing R5- and X4-tropic HIV-1 in the 2000HIV cohort, using Olink Explore 3072 proximity extension assay data. The analysis follows confounder identification (conducted separately) and proceeds through data integration, PCA-based quality assessment, limma-based DEP testing in discovery and validation cohorts, and targeted violin plot visualisation of pre-selected immune proteins. All input file paths should be verified before running.
+```{r setup-chunk, include=FALSE}
+knitr::opts_chunk$set(dev = "png",
+                      dpi = 300,
+                      echo = TRUE,
+                      cache = TRUE)
+```
+
+
+# Load Required Libraries
+```{r load_hidden, echo=FALSE, results="hide", warning=FALSE}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(dplyr)
+  library(car)
+  library(qqplotr)
+  library(GGally)
+  library(ggfortify)
+  library(psych)
+  library(corrplot)
+  library(ggplot2)
+  library(ggrepel)
+  library(randomForest)
+  library(caret)
+  #library(vip)
+  library(FactoMineR)
+  library(factoextra)
+  #library(clusterProfiler)
+  library(enrichplot)
+  library(org.Hs.eg.db)
+  #library(ReactomePA)
+  #library(gage)
+ #library(KEGGREST)
+  library(knitr)
+})  
+
+```
+
+#load and merge datasets
+Three input files are merged: the Olink NPX matrix (post-bridging normalisation and QC), the 2000HIV clinical export, and the tropism classification file. Participants classified as neither R5 nor X4 (including EC_persistent controllers) are excluded. Seasonality is encoded as sine and cosine terms of days since 1 January 2019 to model continuous seasonal variation without assuming a linear trend. Ethnicity and recruitment centre are converted to binary dummy variables for use as covariates in downstream linear models.
+```{r}
+## Create one dataset with OLINK data and clinical data
+# Import OLINK data from the 2000HIV
+library(dplyr)
+library(readxl)
+library(openxlsx)
+
+# Read and clean the dataset
+cov_dat_de_master <- openxlsx::read.xlsx("R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_VROLINK2/updated_OLINK_Explore3072_1910samples_2367proteins_after_bridging_normalization_QCed_21nov2022.xlsx") %>%
+  na.omit()
+
+clinical_df <- read.xlsx("R:/hcrc/Personal folders/Kavita Mehta/2000HIV/clinical data/KAVITA_IMPUT_DATAFRAME_SMOKING_CURRENT_RESOLVED.xlsx") 
+
+out_dir <- "R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_VROLINK2/Coreceptor"
+# Compute days since Jan 1, 2019
+clinical_df <- clinical_df %>%
+  mutate(
+    dayssincejan2019 = as.numeric(as.POSIXct(DATE_VISIT) - as.POSIXct("2019-01-01")),
+    season_sin = sin((2 * pi * dayssincejan2019) / 365.2425),
+    season_cos = cos((2 * pi * dayssincejan2019) / 365.2425),
+    ETHNICITY = as.factor(ETHNICITY)
+  )
+
+# ================================
+# Ethnicity and Center Dummies
+# ================================
+clinical_df <- clinical_df %>%
+  mutate(
+    ASIAN    = as.numeric(ETHNICITY == "Asian"),
+    BLACK    = as.numeric(ETHNICITY == "Black"),
+    HISPANIC = as.numeric(ETHNICITY == "Hispanic"),
+    MIXED    = as.numeric(ETHNICITY == "Mixed"),
+    WHITE    = as.numeric(ETHNICITY == "White"),
+    CENTER_RUMC = as.numeric(CENTER == "RUMC")
+  )
+
+# Create dummy variable for CENTER
+clinical_df <- clinical_df %>%
+  mutate(CENTER_RUMC = as.integer(CENTER == "RUMC"))
+
+# Merge datasets
+cov_dat_de <- clinical_df %>%
+  inner_join(cov_dat_de_master, by = c("ID" = "ID"))
+
+
+# Subset to X4 and R5, remove EC_persistent, and set factor levels
+cov_dat_de <- cov_dat_de %>%
+  filter(Tropism %in% c("X4", "R5")) %>%
+  filter(CONTROLLER_1B != "EC_persistent") %>%
+  mutate(condition = factor(Tropism, levels = c("R5", "X4")))
+
+
+# Handle -Inf values
+cov_dat_de[cov_dat_de == -Inf] <- NA
+
+```
+
+#Import Genetic PCs
+Genetic principal components (PCs) are included as covariates to control for population stratification in the Olink models. The PCA was performed externally on genome-wide SNP data after imputation and QC. The first five genetic PCs are merged into the analysis dataset by participant ID. 
+```{r}
+
+# Function to process genetic pcs data
+process_genetic_pcs <- function(file_path, sample_table, pcs_to_select = 5) {
+  # Read the data
+  genetic_pcs <- read.table(file_path, row.names = 1)
+  
+  # Match the IDs and row names
+  genetic_pcs <- genetic_pcs[match(sample_table$`Study ID`, as.character(genetic_pcs$V2)), ]
+  genetic_pcs$V2 <- sample_table$`Study ID`
+  row.names(genetic_pcs) <- row.names(sample_table)
+  
+  # Replace the NAs with 0
+  genetic_pcs[is.na(genetic_pcs)] <- 0
+  
+  # Choose the first 5 PCs
+  pcs_to_select <- pcs_to_select + 2
+  genetic_pcs_covariates <- genetic_pcs[, 2:pcs_to_select]
+  
+  # Verify the order
+  head(cbind(genetic_pcs$V2, sample_table$`Study ID`))
+  head(genetic_pcs)
+  head(genetic_pcs_covariates)
+  
+  return(genetic_pcs_covariates)
+}
+
+genetic_pcs <-openxlsx::read.xlsx("R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_VROLINK2/2000HIV_preimputed_GRCh38_2000HIV_all_ethnicities_clean_final_complete_cohort_wo_outliers.pca.xlsx") %>% as.data.frame()
+
+
+
+# Function to add principal components to sample table
+add_pcs_to_sample_table <- function(sample_table, genetic_pcs_covariates) {
+  sample_table$PC1_gen <- genetic_pcs_covariates[, 1]
+  sample_table$PC2_gen <- genetic_pcs_covariates[, 2]
+  sample_table$PC3_gen <- genetic_pcs_covariates[, 3]
+  sample_table$PC4_gen <- genetic_pcs_covariates[, 4]
+  sample_table$PC5_gen <- genetic_pcs_covariates[, 5]
+  
+  return(sample_table)
+}
+
+# Add PCs to All samples sample table
+cov_dat_de <- cov_dat_de %>%
+  left_join(genetic_pcs, by = "ID")
+
+#SUBSET COHORT
+cov_dat_de_complete <- cov_dat_de
+cov_dat_de_validation <- subset(cov_dat_de,COHORT == "VALIDATION")
+cov_dat_de_discovery <- subset(cov_dat_de,COHORT == "DISCOVERY")
+```
+
+
+
+#PCA regression analysis
+PCA is run on the full Olink protein matrix (discovery cohort) to assess whether technical and biological covariates explain systematic variance in the proteome. Adjusted R² from univariate regression of each PC score against each covariate is visualised as a heatmap. PCA is then repeated on the residual matrix after regressing out the selected confounders, to confirm that the correction attenuates technical variance without removing biological signal. The protein matrix is identified by column position between ADA_Inflammation and ZPR1_Neurology_II, which are the first and last proteins in the Olink panel block in this dataset; verify these anchors if the column order changes.
+```{r}
+# ================================
+# PCA on OLINK Data: Before and After Correction
+# Heatmap = adjusted R2, pheatmap format
+# ================================
+
+suppressPackageStartupMessages({
+  library(openxlsx)
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(FactoMineR)
+  library(factoextra)
+  library(pheatmap)
+  library(corrplot)
+})
+
+if (!dir.exists(out_dir)) {
+  dir.create(out_dir, recursive = TRUE)
+}
+
+# ================================
+# Dataset
+# ================================
+
+pca_df <- cov_dat_de_discovery
+
+pca_df[pca_df == -Inf] <- NA
+pca_df[pca_df == Inf]  <- NA
+
+# ================================
+# Required covariates, exact order
+# ================================
+
+required_cols <- c(
+  "ID", "AGE", "SEX_BIRTH", "BMI_BASELINE", "SMOKING_CURRENT", "CENTER",
+  "season_sin", "season_cos", "CENTER_RUMC", "ASIAN", "BLACK",
+  "HISPANIC", "MIXED", "WHITE", "PANDEMIC_BEFOREAFTER", "COVID19", "COVID_VACC",
+  "TIMETOLAB", "MUTHIV", "CD4_NADIR", "CD4CD8_PRECART", "VL_ZENITH", "VL_PRECART",
+  "HEPC", "HEPA_BASELINE", "HEPB_BASELINE", "CART_DURATION", "HIV_STAGE_CDC",
+  "EARLY_CART", "HIV_DURATION", paste0("PC", 1:5)
+)
+
+missing_cols <- setdiff(required_cols, colnames(pca_df))
+if (length(missing_cols) > 0) {
+  message("Missing columns: ", paste(missing_cols, collapse = ", "))
+}
+
+required_cols_present <- required_cols[required_cols %in% colnames(pca_df)]
+heatmap_cols          <- required_cols_present[required_cols_present != "ID"]
+
+# ================================
+# Olink protein columns
+# ================================
+
+start_index <- which(colnames(pca_df) == "ADA_Inflammation")
+end_index   <- which(colnames(pca_df) == "ZPR1_Neurology_II")
+
+if (length(start_index) == 0 || length(end_index) == 0) {
+  stop("Could not find ADA_Inflammation or ZPR1_Neurology_II in pca_df.")
+}
+
+selected_columns <- pca_df[, start_index:end_index] %>%
+  mutate(across(everything(), as.numeric))
+
+selected_columns <- selected_columns[, colSums(!is.na(selected_columns)) > 0, drop = FALSE]
+selected_columns <- selected_columns[,
+  apply(selected_columns, 2, function(x) sd(x, na.rm = TRUE) > 0),
+  drop = FALSE
+]
+
+complete_rows        <- complete.cases(selected_columns)
+selected_columns_pca <- selected_columns[complete_rows, , drop = FALSE]
+pca_meta             <- pca_df[complete_rows, , drop = FALSE]
+
+# ================================
+# Custom scree plot function
+# ================================
+
+plot_scree_custom <- function(pca_obj, title, n_dims = 25, pc_cutoff = 5) {
+
+  eig_vals  <- pca_obj$eig[1:n_dims, ]
+  dims      <- 1:n_dims
+  pct       <- eig_vals[, 2]
+  cum_pct   <- eig_vals[, 3]
+
+  cutoff_cum <- cum_pct[pc_cutoff]
+
+  df <- data.frame(
+    Dimension  = dims,
+    Variance   = pct,
+    Cumulative = cum_pct
+  )
+
+  ggplot(df, aes(x = Dimension)) +
+    geom_bar(aes(y = Variance), stat = "identity",
+             fill = "steelblue3", alpha = 0.8) +
+    geom_line(aes(y = Variance), color = "black", linewidth = 0.6) +
+    geom_point(aes(y = Variance), color = "black", size = 2) +
+    geom_line(aes(y = Cumulative), color = "grey50", linewidth = 0.8) +
+    geom_point(aes(y = Cumulative), color = "grey50", size = 2) +
+    geom_vline(xintercept = pc_cutoff, linetype = "dashed",
+               color = "black", linewidth = 0.6) +
+    geom_hline(yintercept = cutoff_cum, linetype = "dotted",
+               color = "grey30", linewidth = 0.5) +
+    annotate("text",
+             x     = pc_cutoff + 0.5,
+             y     = max(pct) * 0.95,
+             label = paste0("PC", pc_cutoff, "\n(cum. ", round(cutoff_cum, 1), "%)"),
+             hjust = 0, size = 3.5, color = "black") +
+    geom_text(aes(y = Variance,
+                  label = paste0(round(Variance, 1), "%")),
+              vjust = -0.5, size = 3, color = "black") +
+    scale_x_continuous(breaks = dims) +
+    scale_y_continuous(
+      name      = "Percentage of explained variance",
+      sec.axis  = sec_axis(~ ., name = "Cumulative variance (%)")
+    ) +
+    labs(title = title, x = "Dimensions") +
+    theme_classic(base_size = 13) +
+    theme(
+      axis.text.x  = element_text(size = 9),
+      axis.title.y = element_text(size = 11),
+      plot.title   = element_text(face = "bold")
+    )
+}
+
+# ================================
+# PCA + adjusted R2 pheatmap function
+# ================================
+
+plot_PCA_regression <- function(pca, meta_data, meta_variables,
+                                title = "PC contribution") {
+
+  pca_res <- as.data.frame(pca$ind$coord[, 1:5, drop = FALSE])
+  colnames(pca_res) <- paste0("PC", 1:ncol(pca_res))
+
+  meta_variables_present <- meta_variables[meta_variables %in% colnames(meta_data)]
+
+  pca_adj_r_sq <- matrix(
+    NA_real_,
+    nrow = length(meta_variables_present),
+    ncol = ncol(pca_res)
+  )
+  rownames(pca_adj_r_sq) <- meta_variables_present
+  colnames(pca_adj_r_sq) <- colnames(pca_res)
+
+  for (i in seq_len(ncol(pca_res))) {
+    for (j in seq_along(meta_variables_present)) {
+
+      var_name <- meta_variables_present[j]
+
+      tmp <- data.frame(
+        pc_value = as.numeric(pca_res[[i]]),
+        covar    = meta_data[[var_name]]
+      )
+      tmp <- tmp[complete.cases(tmp), , drop = FALSE]
+
+      if (nrow(tmp) < 10 || length(unique(tmp$covar)) < 2) {
+        pca_adj_r_sq[j, i] <- NA_real_
+        next
+      }
+
+      if (is.character(tmp$covar) || is.factor(tmp$covar)) {
+        tmp$covar <- as.factor(tmp$covar)
+      } else {
+        tmp$covar <- suppressWarnings(as.numeric(tmp$covar))
+      }
+
+      tmp <- tmp[complete.cases(tmp), , drop = FALSE]
+
+      if (nrow(tmp) < 10 || length(unique(tmp$covar)) < 2) {
+        pca_adj_r_sq[j, i] <- NA_real_
+        next
+      }
+
+      fit <- tryCatch(
+        lm(pc_value ~ covar, data = tmp),
+        error = function(e) NULL
+      )
+
+      if (!is.null(fit)) {
+        pca_adj_r_sq[j, i] <- as.numeric(summary(fit)$adj.r.squared)
+      }
+    }
+  }
+
+  storage.mode(pca_adj_r_sq) <- "numeric"
+
+  pheatmap::pheatmap(
+    pca_adj_r_sq,
+    cluster_rows   = FALSE,
+    cluster_cols   = FALSE,
+    show_rownames  = TRUE,
+    show_colnames  = TRUE,
+    scale          = "none",
+    main           = title,
+    display_numbers = TRUE,
+    number_format  = "%.2f",
+    fontsize        = 12,
+    fontsize_number = 10,
+    color  = colorRampPalette(c("blue", "white", "red"))(50),
+    breaks = seq(-0.5, 0.5, length.out = 51)
+  )
+}
+
+# ================================
+# PCA before correction
+# ================================
+
+mypca <- PCA(selected_columns_pca, ncp = 5, graph = FALSE)
+
+# Scree plot before correction
+pca_scree_plot <- plot_scree_custom(
+  mypca,
+  title     = "Scree plot: Olink PCA before correction",
+  n_dims    = 25,
+  pc_cutoff = 5
+)
+
+ggsave(
+  file.path(out_dir, "Olink_PCA_Scree_Plot_before_correction.pdf"),
+  plot = pca_scree_plot, width = 12, height = 6
+)
+ggsave(
+  file.path(out_dir, "Olink_PCA_Scree_Plot_before_correction.tiff"),
+  plot = pca_scree_plot, width = 12, height = 6,
+  dpi = 600, units = "in", device = "tiff"
+)
+
+# PCA scatter plot before correction
+pca_before_df     <- as.data.frame(mypca$ind$coord)
+pca_before_df$ID  <- pca_meta$ID
+group_var         <- "Tropism"
+
+pca_before_df$Group <- if (group_var %in% colnames(pca_meta)) {
+  as.factor(pca_meta[[group_var]])
+} else {
+  "All samples"
+}
+
+var_pc1 <- round(mypca$eig[1, 2], 1)
+var_pc2 <- round(mypca$eig[2, 2], 1)
+
+pca_before_plot <- ggplot(
+  pca_before_df, aes(x = Dim.1, y = Dim.2, color = Group)
+) +
+  geom_point(size = 2.2, alpha = 0.8) +
+  theme_classic(base_size = 14) +
+  labs(
+    title = "Olink PCA before correction",
+    x     = paste0("PC1 (", var_pc1, "%)"),
+    y     = paste0("PC2 (", var_pc2, "%)"),
+    color = group_var
+  )
+
+ggsave(
+  file.path(out_dir, "Olink_PCA_before_correction.pdf"),
+  plot = pca_before_plot, width = 7, height = 6
+)
+ggsave(
+  file.path(out_dir, "Olink_PCA_before_correction.tiff"),
+  plot = pca_before_plot, width = 7, height = 6,
+  dpi = 600, units = "in", device = "tiff"
+)
+
+# Adjusted R2 heatmap before correction
+pdf(file.path(out_dir, "PCA_Regression_Heatmap_before_correction.pdf"),
+    width = 10, height = 12)
+plot_PCA_regression(mypca, pca_meta, heatmap_cols,
+                    title = "PCA regression heatmap before correction")
+dev.off()
+
+tiff(file.path(out_dir, "PCA_Regression_Heatmap_before_correction.tiff"),
+     width = 10, height = 12, units = "in", res = 600)
+plot_PCA_regression(mypca, pca_meta, heatmap_cols,
+                    title = "PCA regression heatmap before correction")
+dev.off()
+
+# ================================
+# Correlation matrix of covariates
+# ================================
+
+meta_data_cor <- pca_meta %>%
+  dplyr::select(all_of(heatmap_cols)) %>%
+  mutate(across(everything(), ~ as.numeric(as.factor(.))))
+
+cor_matrix <- cor(meta_data_cor, use = "pairwise.complete.obs")
+
+pdf(file.path(out_dir, "Correlation_Matrix_Plot.pdf"), width = 12, height = 10)
+corrplot(
+  cor_matrix,
+  method      = "color",
+  type        = "upper",
+  tl.col      = "black",
+  tl.srt      = 50,
+  tl.cex      = 0.6,
+  addCoef.col = "black",
+  number.cex  = 0.4,
+  col         = colorRampPalette(c("blue", "white", "red"))(200)
+)
+dev.off()
+
+# ================================
+# Residuals PCA after correction
+# ================================
+
+covariates_for_correction <- c(
+  "AGE", "SEX_BIRTH", "BMI_BASELINE", "SMOKING_CURRENT",
+  "CENTER_RUMC", "PC1", "season_cos", "season_sin",
+  "TIMETOLAB", "CD4CD8_PRECART", "PANDEMIC_BEFOREAFTER"
+)
+
+covariates_for_correction <- covariates_for_correction[
+  covariates_for_correction %in% colnames(pca_meta)
+]
+
+residual_matrix <- matrix(
+  NA_real_,
+  nrow = nrow(pca_meta),
+  ncol = ncol(selected_columns_pca)
+)
+colnames(residual_matrix) <- colnames(selected_columns_pca)
+rownames(residual_matrix) <- pca_meta$ID
+
+for (marker_col in colnames(selected_columns_pca)) {
+
+  model_df <- data.frame(
+    row_id = seq_len(nrow(pca_meta)),
+    marker = selected_columns_pca[[marker_col]],
+    pca_meta[, covariates_for_correction, drop = FALSE]
+  )
+  model_df <- model_df[complete.cases(model_df), , drop = FALSE]
+
+  if (nrow(model_df) < 10 || sd(model_df$marker, na.rm = TRUE) == 0) next
+
+  fit <- tryCatch(
+    lm(
+      as.formula(paste("marker ~",
+                       paste(covariates_for_correction, collapse = " + "))),
+      data = model_df
+    ),
+    error = function(e) NULL
+  )
+
+  if (!is.null(fit)) {
+    residual_matrix[model_df$row_id, marker_col] <- residuals(fit)
+  }
+}
+
+residuals_df <- as.data.frame(residual_matrix)
+residuals_df <- residuals_df[, colSums(!is.na(residuals_df)) > 0, drop = FALSE]
+residuals_df <- residuals_df[,
+  apply(residuals_df, 2, function(x) sd(x, na.rm = TRUE) > 0),
+  drop = FALSE
+]
+
+complete_rows_res <- complete.cases(residuals_df)
+residuals_pca     <- residuals_df[complete_rows_res, , drop = FALSE]
+pca_meta_res      <- pca_meta[complete_rows_res, , drop = FALSE]
+
+mypcares <- PCA(residuals_pca, ncp = 5, graph = FALSE)
+
+# Scree plot after correction
+pca_scree_plot_after <- plot_scree_custom(
+  mypcares,
+  title     = "Scree plot: Olink PCA after correction",
+  n_dims    = 25,
+  pc_cutoff = 5
+)
+
+ggsave(
+  file.path(out_dir, "Olink_PCA_Scree_Plot_after_correction.pdf"),
+  plot = pca_scree_plot_after, width = 12, height = 6
+)
+ggsave(
+  file.path(out_dir, "Olink_PCA_Scree_Plot_after_correction.tiff"),
+  plot = pca_scree_plot_after, width = 12, height = 6,
+  dpi = 600, units = "in", device = "tiff"
+)
+
+# PCA scatter plot after correction
+pca_after_df     <- as.data.frame(mypcares$ind$coord)
+pca_after_df$ID  <- pca_meta_res$ID
+
+pca_after_df$Group <- if (group_var %in% colnames(pca_meta_res)) {
+  as.factor(pca_meta_res[[group_var]])
+} else {
+  "All samples"
+}
+
+var_pc1_after <- round(mypcares$eig[1, 2], 1)
+var_pc2_after <- round(mypcares$eig[2, 2], 1)
+
+pca_after_plot <- ggplot(
+  pca_after_df, aes(x = Dim.1, y = Dim.2, color = Group)
+) +
+  geom_point(size = 2.2, alpha = 0.8) +
+  theme_classic(base_size = 14) +
+  labs(
+    title = "Olink PCA after correction",
+    x     = paste0("PC1 (", var_pc1_after, "%)"),
+    y     = paste0("PC2 (", var_pc2_after, "%)"),
+    color = group_var
+  )
+
+ggsave(
+  file.path(out_dir, "Olink_PCA_after_correction.pdf"),
+  plot = pca_after_plot, width = 7, height = 6
+)
+ggsave(
+  file.path(out_dir, "Olink_PCA_after_correction.tiff"),
+  plot = pca_after_plot, width = 7, height = 6,
+  dpi = 600, units = "in", device = "tiff"
+)
+
+# Adjusted R2 heatmap after correction
+heatmap_cols_res <- heatmap_cols[heatmap_cols %in% colnames(pca_meta_res)]
+
+pdf(file.path(out_dir, "PCA_Regression_Heatmap_after_correction.pdf"),
+    width = 10, height = 12)
+plot_PCA_regression(mypcares, pca_meta_res, heatmap_cols_res,
+                    title = "PCA regression heatmap after correction")
+dev.off()
+
+tiff(file.path(out_dir, "PCA_Regression_Heatmap_after_correction.tiff"),
+     width = 10, height = 12, units = "in", res = 600)
+plot_PCA_regression(mypcares, pca_meta_res, heatmap_cols_res,
+                    title = "PCA regression heatmap after correction")
+dev.off()
+```
+
+#linearity check
+Before using PCA-derived scores as the outcome in regression models, three assumptions are checked for each PC-covariate pair: normality of residuals (Q-Q plots), homoscedasticity (residuals versus fitted values with Breusch-Pagan test), and linearity for continuous covariates (natural cubic spline smoother compared to linear fit by ANOVA). Results are saved as an Excel file and diagnostic plots are saved as PDF and TIFF. Only PC1 to PC5 are shown in plots for readability; all ten PCs are included in the saved table.
+```{r}
+# ================================
+# PCA regression assumption checks
+# Reviewer response:
+# Normality, homoscedasticity, and linearity
+#
+# Models: PC score ~ covariate
+#
+# Outputs:
+# 1) Q-Q plots: normality
+# 2) Residuals vs fitted: homoscedasticity
+# 3) Residuals vs fitted for continuous covariates only: linearity
+#    with natural cubic spline smoother, not LOESS
+# ================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(FactoMineR)
+  library(lmtest)
+  library(splines)
+  library(openxlsx)
+  library(ggplot2)
+})
+
+out_dir <- "R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_VROLINK2/ManuscriptTropism/2"
+
+if (!dir.exists(out_dir)) {
+  dir.create(out_dir, recursive = TRUE)
+}
+
+# ================================
+# Covariates used for PCA-based confounder assessment
+# ================================
+
+all_covariates_to_check <- c(
+  "AGE",
+  "SEX_BIRTH",
+  "BMI_BASELINE",
+  "SMOKING_CURRENT",
+  "season_sin",
+  "season_cos",
+  "CENTER_RUMC",
+  "TIMETOLAB",
+  "CD4CD8_PRECART"
+)
+
+# ================================
+# Continuous covariates only
+# Linearity is assessed only for these
+# ================================
+
+continuous_covariates <- c(
+  "AGE",
+  "BMI_BASELINE",
+  "season_sin",
+  "season_cos",
+  "TIMETOLAB",
+  "CD4CD8_PRECART"
+)
+
+# ================================
+# PCA on original Olink data
+# Requires selected_columns_pca and pca_meta already created
+# ================================
+
+mypca <- PCA(selected_columns_pca, ncp = 10, graph = FALSE)
+
+n_pc <- min(10, ncol(mypca$ind$coord))
+
+pca_scores <- as.data.frame(mypca$ind$coord[, 1:n_pc, drop = FALSE])
+colnames(pca_scores) <- paste0("PC", 1:n_pc)
+
+analysis_df <- cbind(pca_scores, pca_meta)
+
+all_covariates_to_check <- all_covariates_to_check[
+  all_covariates_to_check %in% colnames(analysis_df)
+]
+
+continuous_covariates <- continuous_covariates[
+  continuous_covariates %in% colnames(analysis_df)
+]
+
+# ================================
+# Run assumption checks
+# ================================
+
+results <- list()
+diagnostic_data <- list()
+
+for (pc in paste0("PC", 1:n_pc)) {
+  
+  for (covar in all_covariates_to_check) {
+    
+    tmp <- analysis_df[, c(pc, covar)]
+    tmp <- tmp[complete.cases(tmp), , drop = FALSE]
+    
+    if (nrow(tmp) < 20) next
+    
+    colnames(tmp) <- c("pc", "covar")
+    
+    tmp$pc <- as.numeric(tmp$pc)
+    
+    if (covar %in% continuous_covariates) {
+      tmp$covar <- suppressWarnings(as.numeric(tmp$covar))
+    } else {
+      tmp$covar <- as.factor(tmp$covar)
+    }
+    
+    tmp <- tmp[complete.cases(tmp), , drop = FALSE]
+    
+    if (nrow(tmp) < 20 || length(unique(tmp$covar)) < 2) next
+    
+    lm_fit <- tryCatch(
+      lm(pc ~ covar, data = tmp),
+      error = function(e) NULL
+    )
+    
+    if (is.null(lm_fit)) next
+    
+    # Breusch-Pagan test for heteroscedasticity
+    bp_p <- tryCatch(
+      lmtest::bptest(lm_fit)$p.value,
+      error = function(e) NA_real_
+    )
+    
+    # Linearity check only for continuous covariates:
+    # Compare linear model with natural spline model
+    linearity_spline_p <- NA_real_
+    
+    if (covar %in% continuous_covariates && length(unique(tmp$covar)) >= 4) {
+      
+      spline_fit <- tryCatch(
+        lm(pc ~ splines::ns(covar, df = 3), data = tmp),
+        error = function(e) NULL
+      )
+      
+      if (!is.null(spline_fit)) {
+        linearity_spline_p <- tryCatch(
+          anova(lm_fit, spline_fit)$`Pr(>F)`[2],
+          error = function(e) NA_real_
+        )
+      }
+    }
+    
+    results[[length(results) + 1]] <- data.frame(
+      PC = pc,
+      Covariate = covar,
+      Variable_Type = ifelse(
+        covar %in% continuous_covariates,
+        "Continuous",
+        "Categorical"
+      ),
+      N = nrow(tmp),
+      Adj_R2 = summary(lm_fit)$adj.r.squared,
+      BreuschPagan_P = bp_p,
+      Linearity_Spline_P = linearity_spline_p
+    )
+    
+    diagnostic_data[[length(diagnostic_data) + 1]] <- data.frame(
+      PC = pc,
+      Covariate = covar,
+      Variable_Type = ifelse(
+        covar %in% continuous_covariates,
+        "Continuous",
+        "Categorical"
+      ),
+      Fitted = fitted(lm_fit),
+      Residual = residuals(lm_fit),
+      Std_Residual = rstandard(lm_fit)
+    )
+  }
+}
+
+results_df <- bind_rows(results) %>%
+  arrange(PC, Covariate)
+
+diagnostics_df <- bind_rows(diagnostic_data)
+
+# ================================
+# Save assumption test results
+# ================================
+
+write.xlsx(
+  results_df,
+  file = file.path(out_dir, "PCA_Regression_Assumption_Checks.xlsx"),
+  sheetName = "Assumption_Checks",
+  overwrite = TRUE
+)
+
+# ================================
+# Diagnostic plots
+# Representative plots: PC1-PC5 only
+# ================================
+
+pcs_for_plots <- paste0("PC", 1:min(5, n_pc))
+
+diagnostics_plot <- diagnostics_df %>%
+  filter(PC %in% pcs_for_plots)
+
+# ================================
+# 1) Q-Q plots
+# Answer: normality of residuals
+# ================================
+
+qq_plot <- ggplot(diagnostics_plot, aes(sample = Std_Residual)) +
+  stat_qq(size = 0.35, alpha = 0.5) +
+  stat_qq_line(linewidth = 0.4, color = "red") +
+  facet_grid(PC ~ Covariate, scales = "free_y") +
+  theme_bw(base_size = 8) +
+  theme(
+    strip.text.x = element_text(size = 6, angle = 90),
+    strip.text.y = element_text(size = 8),
+    axis.text = element_text(size = 6),
+    axis.title = element_text(size = 8),
+    plot.title = element_text(size = 11, face = "bold"),
+    plot.subtitle = element_text(size = 9)
+  ) +
+  labs(
+    title = "Q-Q plots of standardized residuals",
+    subtitle = "Assesses normality; PCA regression models: PC score ~ covariate",
+    x = "Theoretical quantiles",
+    y = "Standardized residuals"
+  )
+
+ggsave(
+  filename = file.path(out_dir, "PCA_Regression_QQ_Plots_Normality_PC1_to_PC5.pdf"),
+  plot = qq_plot,
+  width = 18,
+  height = 10
+)
+
+ggsave(
+  filename = file.path(out_dir, "PCA_Regression_QQ_Plots_Normality_PC1_to_PC5.tiff"),
+  plot = qq_plot,
+  width = 18,
+  height = 10,
+  dpi = 600,
+  units = "in",
+  device = "tiff"
+)
+
+# ================================
+# 2) Residuals vs fitted plots
+# Answer: homoscedasticity
+# Include continuous + categorical covariates
+# ================================
+
+homoscedasticity_plot <- ggplot(diagnostics_plot, aes(x = Fitted, y = Residual)) +
+  geom_point(size = 0.35, alpha = 0.5) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.4,
+    color = "red"
+  ) +
+  facet_grid(PC ~ Covariate, scales = "free_y") +
+  theme_bw(base_size = 8) +
+  theme(
+    strip.text.x = element_text(size = 6, angle = 90),
+    strip.text.y = element_text(size = 8),
+    axis.text = element_text(size = 6),
+    axis.title = element_text(size = 8),
+    plot.title = element_text(size = 11, face = "bold"),
+    plot.subtitle = element_text(size = 9)
+  ) +
+  labs(
+    title = "Residuals versus fitted values",
+    subtitle = "Assesses homoscedasticity; PCA regression models: PC score ~ covariate",
+    x = "Fitted values",
+    y = "Residuals"
+  )
+
+ggsave(
+  filename = file.path(out_dir, "PCA_Regression_Residuals_vs_Fitted_Homoscedasticity_PC1_to_PC5.pdf"),
+  plot = homoscedasticity_plot,
+  width = 18,
+  height = 10
+)
+
+ggsave(
+  filename = file.path(out_dir, "PCA_Regression_Residuals_vs_Fitted_Homoscedasticity_PC1_to_PC5.tiff"),
+  plot = homoscedasticity_plot,
+  width = 18,
+  height = 10,
+  dpi = 600,
+  units = "in",
+  device = "tiff"
+)
+
+# ================================
+# 3) Linearity plots
+# Answer: linearity
+# Continuous covariates only
+# Natural cubic spline smoother shown, not LOESS
+# ================================
+
+linearity_plot_df <- diagnostics_plot %>%
+  filter(Covariate %in% continuous_covariates)
+
+linearity_plot <- ggplot(linearity_plot_df, aes(x = Fitted, y = Residual)) +
+  geom_point(size = 0.35, alpha = 0.5) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.4,
+    color = "red"
+  ) +
+  geom_smooth(
+    method = "lm",
+    formula = y ~ splines::ns(x, df = 3),
+    se = FALSE,
+    linewidth = 0.5,
+    color = "blue"
+  ) +
+  facet_grid(PC ~ Covariate, scales = "free_y") +
+  theme_bw(base_size = 8) +
+  theme(
+    strip.text.x = element_text(size = 7),
+    strip.text.y = element_text(size = 8),
+    axis.text = element_text(size = 6),
+    axis.title = element_text(size = 8),
+    plot.title = element_text(size = 11, face = "bold"),
+    plot.subtitle = element_text(size = 9)
+  ) +
+  labs(
+    title = "Residual trends for continuous covariates",
+    subtitle = "Assesses linearity; natural cubic spline smoother shown",
+    x = "Fitted values",
+    y = "Residuals"
+  )
+
+ggsave(
+  filename = file.path(out_dir, "PCA_Regression_Linearity_Continuous_Covariates_PC1_to_PC5.pdf"),
+  plot = linearity_plot,
+  width = 14,
+  height = 10
+)
+
+ggsave(
+  filename = file.path(out_dir, "PCA_Regression_Linearity_Continuous_Covariates_PC1_to_PC5.tiff"),
+  plot = linearity_plot,
+  width = 14,
+  height = 10,
+  dpi = 600,
+  units = "in",
+  device = "tiff"
+)
+
+# ================================
+# Print results
+# ================================
+
+results_df
+```
+
+#DEPs in complete Cohort
+Differential protein expression between R5 and X4 is tested using limma with empirical Bayes moderation, in the complete cohort first and then separately in discovery and validation subsets. The design matrix includes age, sex at birth, BMI, smoking status, seasonality (sine and cosine), genetic PC1, time to blood processing, pre-ART CD4:CD8 ratio, and recruitment centre. CD4CD8_PRECART has 258 missing values; after confirming a right-skewed distribution, missing values are imputed using k-nearest neighbours (k = 5) to avoid excluding approximately 17% of participants for a single covariate. The correlation between season terms and PANDEMIC_BEFOREAFTER exceeded 0.5; PANDEMIC_BEFOREAFTER was therefore dropped from the final model. Proteins are identified by column index between ADA_Inflammation and ZPR1_Neurology_II — verify these anchors if the dataset is updated.
+```{r}
+library(VIM)
+library(ggplot2)
+library(reshape2)
+library(openxlsx)
+library(stringr)
+library(limma)
+
+
+
+# Design matrix with covariates
+cov_dat_de_complete_pr <- cov_dat_de_complete$condition
+condition <-
+  factor(cov_dat_de_complete_pr,
+         levels = c("R5", "X4"))
+#colnames(cov_dat_de_complete)
+
+# Before removing the cases with NAs in any of the covariates let's check the number of samples we get before and after the removal of non-complete cases
+dim(cov_dat_de_complete)
+# [1] 1480 2665
+cov_dat_de_complete[complete.cases(cov_dat_de_complete[, c("AGE", "SEX_BIRTH", "BMI_BASELINE", "SMOKING_CURRENT", "PANDEMIC_BEFOREAFTER", "season_sin", "season_cos", "CENTER_RUMC","PC1", "CD4CD8_PRECART",  "condition")]), ] %>% dim()
+# [1] 1222 2665
+
+# Let's check which variables contribute to the missingness
+selected_vars <- c("AGE", "SEX_BIRTH", "BMI_BASELINE", "SMOKING_CURRENT", 
+                   "PANDEMIC_BEFOREAFTER", "season_sin", "season_cos", 
+                   "CENTER_RUMC", "PC1", "CD4CD8_PRECART", "condition")
+
+na_counts_selected <- colSums(is.na(cov_dat_de_complete[selected_vars]))
+print(na_counts_selected)
+         #         AGE            SEX_BIRTH         BMI_BASELINE      SMOKING_CURRENT PANDEMIC_BEFOREAFTER           season_sin           season_cos 
+         #           0                    0                    0                    0                    0                    0                    0 
+         # CENTER_RUMC              PC1       CD4CD8_PRECART            condition 
+         #           0                    0                  258                    0 
+
+# All the missing values come from CD4CD8_PRECART, it might be not worth it to lose so many samples for just one variable, let's try to impute it.
+# To impute it let's first check its distribution
+ggplot(cov_dat_de_complete, aes(x = CD4CD8_PRECART)) +
+  geom_histogram(binwidth = 0.1, fill = "skyblue", color = "black", alpha = 0.7) +
+  geom_density(aes(y = ..density.. * max(..count..)), color = "red", linewidth = 1) +
+  theme_minimal() +
+  labs(title = "Distribution of CD4CD8_PRECART",
+       x = "CD4/CD8 Pre-CART",
+       y = "Count") +
+  theme(text = element_text(size = 14))
+# Based on the histogram and density plot, the CD4CD8_PRECART variable appears to have a right-skewed distribution, with most values concentrated near zero and a long tail extending to higher values.
+# Recommended imputations in these cases are: Median imputation (less sensitive to outliers) or kNN (k-Nearest Neighbors)
+# Let's use kNN as it is a state of the ART
+cov_dat_de_complete <- kNN(cov_dat_de_complete, variable = "CD4CD8_PRECART", k = 5)
+
+# Let's check again for complete cases
+cov_dat_de_complete[complete.cases(cov_dat_de_complete[, c("AGE", "SEX_BIRTH", "BMI_BASELINE", "SMOKING_CURRENT", "PANDEMIC_BEFOREAFTER", "season_sin", "season_cos", "CENTER_RUMC","PC1", "CD4CD8_PRECART", "condition")]), ] %>% dim()
+# [1] 1480 2666
+
+# Nice, we did not lose any samples as all the variables have now no missingness, let's continue.
+
+#complete cases for covariate
+cov_dat_de_complete <- cov_dat_de_complete[complete.cases(cov_dat_de_complete[, c("AGE", "SEX_BIRTH", "BMI_BASELINE", "SMOKING_CURRENT", "PANDEMIC_BEFOREAFTER", "season_sin", "season_cos", "CENTER_RUMC","PC1", "CD4CD8_PRECART",  "condition")]), ]
+
+# Maybe before running the model let's check for multicollinearity, as a quick check we could check the correlation across variables
+# Load necessary libraries
+
+# Convert factor "condition" into numeric
+cov_dat_de_complete$condition_numeric <- as.numeric(cov_dat_de_complete$condition)
+
+cov_dat_de_complete |>
+  dplyr::select(AGE, SEX_BIRTH, BMI_BASELINE, SMOKING_CURRENT,
+                PANDEMIC_BEFOREAFTER, season_sin, season_cos,
+                PC1, CD4CD8_PRECART, CENTER_RUMC, condition_numeric) |>
+  sapply(class)
+
+cov_dat_de |>
+  dplyr::select(AGE, SEX_BIRTH, BMI_BASELINE, SMOKING_CURRENT,
+                PANDEMIC_BEFOREAFTER, season_sin, season_cos,
+                PC1, CD4CD8_PRECART, CENTER_RUMC) |>
+  sapply(class)
+
+# Calculate the correlation matrix for the specified variables
+correlation_matrix <- cor(cov_dat_de_complete[, c("AGE", "SEX_BIRTH", "BMI_BASELINE", "SMOKING_CURRENT", 
+                                                    "PANDEMIC_BEFOREAFTER", "season_sin", 
+                                                    "season_cos", "PC1", "CD4CD8_PRECART", 
+                                                    "CENTER_RUMC", "condition_numeric")], 
+                          use = "pairwise.complete.obs")
+
+# Melt the correlation matrix to long format
+correlation_melted <- melt(correlation_matrix)
+
+# Create the heatmap using ggplot2
+ggplot(data = correlation_melted, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                       midpoint = 0, limit = c(-1, 1), 
+                       name = "Correlation") +
+  geom_text(aes(label = round(value, 2)), color = "black", size = 4) + # Add this line
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Correlation Heatmap", x = "Variables", y = "Variables")
+
+# It seems like seasonality and pandemic before and after are correlated (>50% correlation), we could try removing one (PANDEMIC_BEFOREAFTER), but after running the model
+# it seems to make no difference after multiple testing correction, but is often preferable to choose the most simple model to avoid overcorrection
+design_cov <-
+  model.matrix(
+    ~ AGE + SEX_BIRTH + BMI_BASELINE + SMOKING_CURRENT + season_sin + season_cos + PC1 + TIMETOLAB + CD4CD8_PRECART + CENTER_RUMC  + condition,
+    data = cov_dat_de_complete
+  )
+
+dim(design_cov)
+print(colnames(design_cov))
+print(rownames(contrasts))
+# Generate the protein expression matrix 
+# Transform NPX data for proteins to represent rows - no group names
+start_index <- which(colnames(cov_dat_de_complete) == "ADA_Inflammation")
+end_index <- which(colnames(cov_dat_de_complete) == "ZPR1_Neurology_II")
+
+
+cov_dat_proteins <- cov_dat_de_complete[, start_index:end_index]
+cov_dat_de_complete_tr <- as.matrix(t(cov_dat_proteins))
+dim(cov_dat_de_complete_tr)
+#Fitting models for differentially expressed genes
+cont.matrix_cov <- makeContrasts("conditionX4", levels = design_cov)
+fit1_cov <- lmFit(cov_dat_de_complete_tr, design_cov)
+fit2_cov <- contrasts.fit(fit1_cov, cont.matrix_cov)
+fit2_cov <- eBayes(fit2_cov)
+
+# Display "N" number of differentially expressed genes 
+# Use this object for volcano plot 
+DEP_cov <- topTable(fit2_cov, coef = "conditionX4", adjust = "BH", number = dim(cov_dat_de_complete_tr)[1]) 
+DEP_cov$Cohort <- "Complete"
+
+# Let's create a column with the protein names
+DEP_cov$Protein <- str_split_i(rownames(DEP_cov), "_", i = 1)
+DEP_cov$Panel <- str_split_i(rownames(DEP_cov), "_", i = 2)
+
+#Display number of proteins significantly expressed in two groups
+results_cov <- decideTests(fit2_cov)
+
+# Display the number of UP and Down
+summary(results_cov)
+#  DiseasetvsHealthy
+#Down                   4
+#NotSig                20
+#Up                    61
+
+# Extract significant proteins
+DEP_cov <- topTable(fit2_cov, coef = "conditionX4", adjust = "BH", number = dim(cov_dat_de_complete_tr)[1])
+
+# Add cohort label
+DEP_cov$Cohort <- "Complete"
+
+# Extract protein name and panel
+DEP_cov$Protein <- str_split_i(rownames(DEP_cov), "_", i = 1)  # Extract protein name
+DEP_cov$Panel <- str_split_i(rownames(DEP_cov), "_", i = 2)    # Extract panel name
+
+# Select relevant columns for export
+DEP_cov_export <- DEP_cov[, c("Protein", "Panel", "P.Value", "adj.P.Val", "logFC", "t", "Cohort")]
+
+# Rename columns for clarity
+colnames(DEP_cov_export) <- c("Protein", "Short_Name", "P_Value", "Adj_P_Value", "Fold_Change", "t_stat" ,"Cohort")
+
+# Print the **top 20 significant proteins**
+print(head(DEP_cov_export, 20))
+
+#Save as Excel file
+write.xlsx(DEP_cov_export, file = "R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_VROLINK2/ManuscriptTropism/Significant_Proteins_CompleteCohort.xlsx", rowNames = FALSE)
+
+
+# Load necessary libraries
+library(ggplot2)
+library(ggrepel)
+
+# Define significance thresholds
+pval_threshold <- 0.05
+adj_pval_threshold <- 0.05
+
+# Volcano Plot using P.Value
+volcano_pval <- ggplot(DEP_cov, aes(x = logFC, y = -log10(P.Value), label = Protein)) +
+  geom_point(aes(color = P.Value < pval_threshold), size = 3) +
+  scale_color_manual(values = c("black", "red")) +  # Red = Significant, Black = Not Significant
+  geom_hline(yintercept = -log10(pval_threshold), linetype = "dashed", color = "gray") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +
+  geom_text_repel(data = subset(DEP_cov, P.Value < pval_threshold), size = 3, max.overlaps = Inf) +  
+  theme_bw() +
+  labs(
+    title = "Volcano Plot - complete Cohort",
+    x = "Log Fold Change (logFC)",
+    y = "-log10(P.Value)"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
+
+# Display the plot
+print(volcano_pval)
+
+# Save the P.Value volcano plot
+ggsave("R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_VROLINK2/ManuscriptTropism/Volcano_Plot_PValue_CompleteCohort.pdf", plot = volcano_pval, width = 10, height = 10, dpi = 300)
+
+# Volcano Plot using Adjusted P.Value
+volcano_adj_pval <- ggplot(DEP_cov, aes(x = logFC, y = -log10(adj.P.Val), label = Protein)) +
+  geom_point(aes(color = adj.P.Val < adj_pval_threshold), size = 3) +
+  scale_color_manual(values = c("black", "red")) +
+  geom_hline(yintercept = -log10(adj_pval_threshold), linetype = "dashed", color = "gray") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +
+  geom_text_repel(data = subset(DEP_cov, adj.P.Val < adj_pval_threshold), size = 5, max.overlaps = Inf) +  
+  theme_bw() +
+  labs(
+    title = "Volcano Plot - CompleteCohort Adjusted P.Value",
+    x = "Log Fold Change (logFC)",
+    y = "-log10(Adj.P.Value)"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
+
+# Display the plot
+print(volcano_adj_pval)
+
+# Save the Adjusted P.Value volcano plot
+ggsave("R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_VROLINK2/ManuscriptTropism/Volcano_Plot_AdjPValue_CompleteCohort.pdf", plot = volcano_adj_pval, width = 10, height = 10, dpi = 300)
+
+# Select relevant participant-level data
+participant_data <- cov_dat_de_complete[, c("ID", "Tropism",  "SEX_BIRTH", "COHORT")]
+
+# Rename columns for clarity
+colnames(participant_data) <- c("Participant_ID", "Tropism", "Sex_Birth", "cohort")
+
+# Save participant data to Excel
+write.xlsx(participant_data, 
+           file = "R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_VROLINK2/ManuscriptTropism/CompleteCohort_Participants.xlsx", 
+            rowNames = FALSE)
+
+#Display number of proteins significantly expressed in two groups
+results_cov <- decideTests(fit2_cov)
+
+# Display the number of UP and Down
+summary(results_cov)
+#  DiseasetvsHealthy
+#Down                   4
+#NotSig                20
+#Up                    61
+
+```
+
+
+
+#DEPs in Discovery cohort
+```{r}
+# Design matrix with covariates
+cov_dat_de_discovery_pr <- cov_dat_de_discovery$condition
+condition <-
+  factor(cov_dat_de_discovery_pr,
+         levels = c("R5", "X4"))
+colnames(cov_dat_de_discovery)
+
+# Let's use kNN as it is a state of the ART
+cov_dat_de_discovery <- kNN(cov_dat_de_discovery, variable = "CD4CD8_PRECART", k = 5)
+
+cov_dat_de_discovery <- cov_dat_de_discovery[complete.cases(cov_dat_de_discovery[, c("AGE", "SEX_BIRTH", "BMI_BASELINE", "SMOKING_CURRENT","PANDEMIC_BEFOREAFTER", "season_sin", "season_cos",  "PC1", "CD4CD8_PRECART", "CENTER_RUMC", "condition")]), ]
+
+design_cov <-
+  model.matrix(
+    ~ AGE+ SEX_BIRTH + BMI_BASELINE + SMOKING_CURRENT + season_sin + season_cos + PC1 + CD4CD8_PRECART + CENTER_RUMC + TIMETOLAB + condition,
+    data = cov_dat_de_discovery
+  )
+
+dim(design_cov)
+colnames(design_cov)
+
+# Generate the protein expression matrix 
+# Transform NPX data for proteins to represent rows - no group names
+
+# Get indices from cov_dat_de_discovery)
+start_index <- which(colnames(cov_dat_de_discovery) == "ADA_Inflammation")
+end_index <- which(colnames(cov_dat_de_discovery) == "ZPR1_Neurology_II")
+
+
+cov_dat_proteins <- cov_dat_de_discovery[, start_index:end_index]
+cov_dat_de_discovery_tr <- as.matrix(t(cov_dat_proteins))
+dim(cov_dat_de_discovery_tr)
+#Fitting models for differentially expressed genes
+fit1_cov <- lmFit(cov_dat_de_discovery_tr, design_cov)
+cont.matrix_cov <- makeContrasts("conditionX4", levels = design_cov)
+fit2_cov <- contrasts.fit(fit1_cov, cont.matrix_cov)
+fit2_cov <- eBayes(fit2_cov)
+
+# Display "N" number of differentially expressed genes 
+# Use this object for volcano plot 
+DEP_cov_discovery <- topTable(fit2_cov, coef = "conditionX4", adjust = "BH", number = dim(cov_dat_de_discovery_tr)[1]) 
+DEP_cov_discovery$Cohort <- "Discovery"
+
+# Let's create a column with the protein names
+DEP_cov_discovery$Protein <- str_split_i(rownames(DEP_cov_discovery), "_", i = 1)
+DEP_cov_discovery$Panel <- str_split_i(rownames(DEP_cov_discovery), "_", i = 2)
+
+#Display number of proteins significantly expressed in two groups
+results_cov <- decideTests(fit2_cov)
+
+# Display the number of UP and Down
+summary(results_cov)
+#  DiseasetvsHealthy
+#Down                   4
+#NotSig                20
+#Up                    61
+
+
+library(openxlsx)
+library(stringr)
+library(limma)
+
+# Extract significant proteins
+DEP_cov_discovery <- topTable(fit2_cov, coef = "conditionX4", adjust = "BH", number = dim(cov_dat_de_discovery_tr)[1])
+
+# Add cohort label
+DEP_cov_discovery$Cohort <- "Discovery"
+
+# Extract protein name and panel
+DEP_cov_discovery$Protein <- str_split_i(rownames(DEP_cov_discovery), "_", i = 1)  # Extract protein name
+DEP_cov_discovery$Panel <- str_split_i(rownames(DEP_cov_discovery), "_", i = 2)    # Extract panel name
+
+# Select relevant columns for export
+DEP_cov_discovery_export <- DEP_cov_discovery[, c("Protein", "Panel", "P.Value", "adj.P.Val", "logFC", "t", "Cohort")]
+
+# Rename columns for clarity
+colnames(DEP_cov_discovery_export) <- c("Protein", "Short_Name", "P_Value", "Adj_P_Value", "Fold_Change", "t_stat", "Cohort")
+
+# Print the **top 20 significant proteins**
+print(head(DEP_cov_discovery_export, 20))
+
+# Save as Excel file
+write.xlsx(DEP_cov_discovery_export, file = "R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_VROLINK2/ManuscriptTropism/Significant_Proteins_DiscoveryCohort.xlsx", rowNames = FALSE)
+
+
+# Load necessary libraries
+library(ggplot2)
+library(ggrepel)
+
+# Define significance thresholds
+pval_threshold <- 0.05
+adj_pval_threshold <- 0.05
+
+# Volcano Plot using P.Value
+volcano_pval <- ggplot(DEP_cov_discovery, aes(x = logFC, y = -log10(P.Value), label = Protein)) +
+  geom_point(aes(color = P.Value < pval_threshold), size = 3) +
+  scale_color_manual(values = c("black", "red")) +  # Red = Significant, Black = Not Significant
+  geom_hline(yintercept = -log10(pval_threshold), linetype = "dashed", color = "gray") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +
+  geom_text_repel(data = subset(DEP_cov_discovery, P.Value < pval_threshold), size = 3, max.overlaps = Inf) +  
+  theme_bw() +
+  labs(
+    title = "Volcano Plot - DiscoveryCohort",
+    x = "Log Fold Change (logFC)",
+    y = "-log10(P.Value)"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
+
+# Display the plot
+print(volcano_pval)
+
+# Save the P.Value volcano plot
+ggsave("R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_VROLINK2/ManuscriptTropism/Volcano_Plot_PValue_DiscoveryCohort.pdf", plot = volcano_pval, width = 10, height = 10, dpi = 300)
+
+# Volcano Plot using Adjusted P.Value
+volcano_adj_pval <- ggplot(DEP_cov_discovery, aes(x = logFC, y = -log10(adj.P.Val), label = Protein)) +
+  geom_point(aes(color = adj.P.Val < adj_pval_threshold), size = 3) +
+  scale_color_manual(values = c("black", "red")) +
+  geom_hline(yintercept = -log10(adj_pval_threshold), linetype = "dashed", color = "gray") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +
+  geom_text_repel(data = subset(DEP_cov_discovery, adj.P.Val < adj_pval_threshold), size = 5, max.overlaps = Inf) +  
+  theme_bw() +
+  labs(
+    title = "Volcano Plot - DiscoveryCohort Adjusted P.Value",
+    x = "Log Fold Change (logFC)",
+    y = "-log10(Adj.P.Value)"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
+
+# Display the plot
+print(volcano_adj_pval)
+
+# Save the Adjusted P.Value volcano plot
+ggsave("R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_VROLINK2/ManuscriptTropism/Volcano_Plot_AdjPValue_DiscoveryCohort.pdf", plot = volcano_adj_pval, width = 10, height = 10, dpi = 300)
+
+# Select relevant participant-level data
+participant_data <- cov_dat_de_discovery[, c("ID", "Tropism", "SEX_BIRTH", "COHORT")]
+
+# Rename columns for clarity
+colnames(participant_data) <- c("Participant_ID", "Tropism", "Sex_Birth", "cohort")
+
+# Save participant data to Excel
+write.xlsx(participant_data, 
+           file = "R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_VROLINK2/ManuscriptTropism/DiscoveryCohort_Participants.xlsx", 
+           rowNames = FALSE)
+
+#Display number of proteins significantly expressed in two groups
+results_cov <- decideTests(fit2_cov)
+
+# Display the number of UP and Down
+summary(results_cov)
+#  DiseasetvsHealthy
+#Down                   4
+#NotSig                20
+#Up                    61
+
+```
+
+# DEPs in Validation cohort
+The same limma model is applied in the validation cohort independently. Significant proteins from the discovery cohort are evaluated for directional consistency and nominal significance in the validation cohort.
+```{r}
+# Design matrix with covariates
+cov_dat_de_validation_pr <- cov_dat_de_validation$condition
+condition <-
+  factor(cov_dat_de_validation_pr,
+         levels = c("R5", "X4"))
+colnames(cov_dat_de_validation)
+
+# Let's use kNN as it is a state of the ART
+cov_dat_de_validation <- kNN(cov_dat_de_validation, variable = "CD4CD8_PRECART", k = 5)
+
+cov_dat_de_validation <- cov_dat_de_validation[complete.cases(cov_dat_de_validation[, c("AGE", "SEX_BIRTH", "BMI_BASELINE", "SMOKING_CURRENT", "PANDEMIC_BEFOREAFTER", "season_sin", "season_cos", "CD4CD8_PRECART" , "CENTER_RUMC","PC1", "condition")]), ]
+
+design_cov <-
+  model.matrix(
+    ~ AGE+ SEX_BIRTH + BMI_BASELINE + SMOKING_CURRENT + season_sin + season_cos + PC1  + CD4CD8_PRECART + TIMETOLAB  + condition,
+    data = cov_dat_de_validation
+  )
+
+dim(design_cov)
+colnames(design_cov)
+
+# Generate the protein expression matrix 
+# Transform NPX data for proteins to represent rows - no group names
+
+# Get indices from cov_dat_de_validation
+start_index <- which(colnames(cov_dat_de_validation) == "ADA_Inflammation")
+end_index <- which(colnames(cov_dat_de_validation) == "ZPR1_Neurology_II")
+
+cov_dat_proteins <- cov_dat_de_validation[, start_index:end_index]
+cov_dat_de_validation_tr <- as.matrix(t(cov_dat_proteins))
+dim(cov_dat_de_validation_tr)
+#Fitting models for differentially expressed genes
+fit1_cov <- lmFit(cov_dat_de_validation_tr, design_cov)
+cont.matrix_cov <- makeContrasts("conditionX4", levels = design_cov)
+fit2_cov <- contrasts.fit(fit1_cov, cont.matrix_cov)
+fit2_cov <- eBayes(fit2_cov)
+
+# Display "N" number of differentially expressed genes 
+# Use this object for volcano plot 
+DEP_cov_validation <- topTable(fit2_cov, coef = "conditionX4", adjust = "BH", number = dim(cov_dat_de_validation_tr)[1]) 
+DEP_cov_validation$Cohort <- "Validation"
+
+# Let's create a column with the protein names
+DEP_cov_validation$Protein <- str_split_i(rownames(DEP_cov_validation), "_", i = 1)
+DEP_cov_validation$Panel <- str_split_i(rownames(DEP_cov_validation), "_", i = 2)
+
+#Display number of proteins significantly expressed in two groups
+results_cov <- decideTests(fit2_cov)
+
+# Display the number of UP and Down
+summary(results_cov)
+#  DiseasetvsHealthy
+#Down                   4
+#NotSig                20
+#Up                    61
+
+
+library(openxlsx)
+library(stringr)
+library(limma)
+
+# Extract significant proteins
+DEP_cov_validation <- topTable(fit2_cov, coef = "conditionX4", adjust = "BH", number = dim(cov_dat_de_validation_tr)[1])
+
+# Add cohort label
+DEP_cov_validation$Cohort <- "Validation"
+
+# Extract protein name and panel
+DEP_cov_validation$Protein <- str_split_i(rownames(DEP_cov_validation), "_", i = 1)  # Extract protein name
+DEP_cov_validation$Panel <- str_split_i(rownames(DEP_cov_validation), "_", i = 2)    # Extract panel name
+
+
+
+# Select relevant columns for export
+DEP_cov_validation_export <- DEP_cov_validation[, c("Protein", "Panel", "P.Value", "adj.P.Val", "logFC", "t" , "Cohort")]
+
+# Rename columns for clarity
+colnames(DEP_cov_validation_export) <- c("Protein", "Short_Name", "P_Value", "Adj_P_Value", "Fold_Change", "t_stat", "Cohort")
+
+# Print the **top 20 significant proteins**
+print(head(DEP_cov_validation_export, 20))
+
+# Save as Excel file
+write.xlsx(DEP_cov_validation_export, file = "R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_VROLINK2/ManuscriptTropism/Significant_Proteins_ValidationCohort.xlsx", rowNames = FALSE)
+
+
+# Load necessary libraries
+library(ggplot2)
+library(ggrepel)
+
+# Define significance thresholds
+pval_threshold <- 0.05
+adj_pval_threshold <- 0.05
+
+# Volcano Plot using P.Value
+volcano_pval <- ggplot(DEP_cov_validation, aes(x = logFC, y = -log10(P.Value), label = Protein)) +
+  geom_point(aes(color = P.Value < pval_threshold), size = 3) +
+  scale_color_manual(values = c("black", "red")) +  # Red = Significant, Black = Not Significant
+  geom_hline(yintercept = -log10(pval_threshold), linetype = "dashed", color = "gray") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +
+  geom_text_repel(data = subset(DEP_cov_validation, P.Value < pval_threshold), size = 3, max.overlaps = Inf) +  
+  theme_bw() +
+  labs(
+    title = "Volcano Plot - ValidationCohort",
+    x = "Log Fold Change (logFC)",
+    y = "-log10(P.Value)"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
+
+# Display the plot
+print(volcano_pval)
+
+# Save the P.Value volcano plot
+ggsave("R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_VROLINK2/ManuscriptTropism/Volcano_Plot_PValue_ValidationCohort.pdf", plot = volcano_pval, width = 10, height = 10, dpi = 300)
+
+# Volcano Plot using Adjusted P.Value
+volcano_adj_pval <- ggplot(DEP_cov_validation, aes(x = logFC, y = -log10(adj.P.Val), label = Protein)) +
+  geom_point(aes(color = adj.P.Val < adj_pval_threshold), size = 3) +
+  scale_color_manual(values = c("black", "red")) +
+  geom_hline(yintercept = -log10(adj_pval_threshold), linetype = "dashed", color = "gray") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +
+  geom_text_repel(data = subset(DEP_cov_validation, adj.P.Val < adj_pval_threshold), size = 5, max.overlaps = Inf) +  
+  theme_bw() +
+  labs(
+    title = "Volcano Plot - ValidationCohort Adjusted P.Value",
+    x = "Log Fold Change (logFC)",
+    y = "-log10(Adj.P.Value)"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
+
+# Display the plot
+print(volcano_adj_pval)
+
+# Save the Adjusted P.Value volcano plot
+ggsave("R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_VROLINK2/ManuscriptTropism/Volcano_Plot_AdjPValue_ValidationCohort.pdf", plot = volcano_adj_pval, width = 10, height = 10, dpi = 300)
+
+# Select relevant participant-level data
+participant_data <- cov_dat_de_validation[, c("ID", "Tropism", "SEX_BIRTH", "COHORT")]
+
+# Rename columns for clarity
+colnames(participant_data) <- c("Participant_ID", "Tropism", "Sex_Birth", "cohort")
+
+# Save participant data to Excel
+write.xlsx(participant_data, 
+           file = "R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_VROLINK2/ManuscriptTropism/ValidationCohort_Participants.xlsx", 
+           rowNames = FALSE)
+
+#Display number of proteins significantly expressed in two groups
+results_cov <- decideTests(fit2_cov)
+
+# Display the number of UP and Down
+summary(results_cov)
+#  DiseasetvsHealthy
+#Down                   4
+#NotSig                20
+#Up                    61
+
+
+```
+
+
+
+#common proteins in both cohorts
+Discovery and validation DEP results are merged on protein name and classified into six groups based on directional consistency and significance thresholds: significant in both cohorts with consistent direction, significant in both with opposite direction, nominally significant in discovery with consistent direction in validation, discovery-only, validation-only, and not significant. The biplot displays log fold change in discovery (x-axis) against validation (y-axis), with the top 20 proteins from the "significant in discovery, same direction" category labelled. The full protein lists for this category, split by direction of effect, are printed to the console.
+```{r}
+# ===== Biplot: focus on "Significant in discovery (Same Direction)" =====
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(ggrepel)
+  library(readxl)
+})
+
+disc_path <- "R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_VROLINK2/ManuscriptTropism/Significant_Proteins_DiscoveryCohort.xlsx"
+vali_path <- "R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_VROLINK2/ManuscriptTropism/Significant_Proteins_ValidationCohort.xlsx"
+
+DEP_cov_discovery  <- read_excel(disc_path)
+DEP_cov_validation <- read_excel(vali_path)
+
+# --- CONFIG ---
+p_thresh <- 0.05
+out_file <- "R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_VROLINK2/ManuscriptTropism/Biplot_logFC_Disc_vs_Val_DISC_SameDir_top30.pdf"
+
+# --- Merge limma outputs (raw p only) ---
+# Requires DEP_cov_discovery and DEP_cov_validation (topTable outputs)
+logfc_comparison <- merge(
+  DEP_cov_discovery[, c("Protein","Fold_Change","P_Value","Adj_P_Value")],
+  DEP_cov_validation[, c("Protein","Fold_Change","P_Value", "Adj_P_Value")],
+  by = "Protein",
+  suffixes = c("_Discovery", "_Validation")
+)
+
+# --- Direction consistency flag ---
+logfc_comparison <- logfc_comparison %>%
+  mutate(Direction_Consistent = sign(Fold_Change_Discovery) == sign(Fold_Change_Validation))
+
+# --- Grouping (raw p only) ---
+logfc_comparison <- logfc_comparison %>%
+  mutate(
+    Group = case_when(
+     Adj_P_Value_Discovery < p_thresh & P_Value_Validation < p_thresh & Direction_Consistent ~
+        "Significant in Both (Same Direction)",
+      Adj_P_Value_Discovery < p_thresh & P_Value_Validation < p_thresh & !Direction_Consistent ~
+        "Significant in Both (Opposite Direction)",
+      P_Value_Discovery < p_thresh & Direction_Consistent ~
+        "Significant in discovery (Same Direction)",
+      Adj_P_Value_Discovery < p_thresh & !(P_Value_Validation < p_thresh) ~
+        "Discovery Only",
+      !(Adj_P_Value_Discovery < p_thresh) & P_Value_Validation < p_thresh ~
+        "Validation Only",
+      TRUE ~ "Not Significant"
+    ),
+    Group = factor(
+      Group,
+      levels = c(
+        "Significant in Both (Same Direction)",
+        "Significant in Both (Opposite Direction)",
+        "Significant in discovery (Same Direction)",
+        "Discovery Only",
+        "Validation Only",
+        "Not Significant"
+      )
+    )
+  )
+
+# ===== Focus category =====
+focus_cat <- "Significant in discovery (Same Direction)"
+
+disc_same_df <- logfc_comparison %>%
+  filter(as.character(Group) == focus_cat) %>%
+  mutate(abs_fc = abs(Fold_Change_Discovery))
+
+# Print ALL proteins in the category (and UP/DOWN splits)
+cat("\n===== ALL proteins in category: ", focus_cat, " =====\n", sep = "")
+if (nrow(disc_same_df)) {
+  print(disc_same_df$Protein)
+} else {
+  cat("None\n")
+}
+
+all_up_disc_same <- disc_same_df %>%
+  filter(Fold_Change_Discovery > 0) %>%
+  arrange(P_Value_Discovery, desc(abs_fc)) %>%
+  pull(Protein)
+
+all_down_disc_same <- disc_same_df %>%
+  filter(Fold_Change_Discovery < 0) %>%
+  arrange(P_Value_Discovery, desc(abs_fc)) %>%
+  pull(Protein)
+
+cat("\n----- UP (Discovery FC > 0) -----\n")
+if (length(all_up_disc_same)) print(all_up_disc_same) else cat("None\n")
+
+cat("\n----- DOWN (Discovery FC < 0) -----\n")
+if (length(all_down_disc_same)) print(all_down_disc_same) else cat("None\n")
+
+# ===== Labels: TOP 30 from the focus category (by p then |FC|, any direction) =====
+label_df <- disc_same_df %>%
+  arrange(P_Value_Discovery, desc(abs_fc)) %>%
+  slice_head(n = 20) %>%
+  mutate(Label = Protein)
+
+cat("\n===== Labeled (Top 30 within category) =====\n")
+if (nrow(label_df)) print(label_df$Protein) else cat("None (category empty)\n")
+
+# ===== Plot =====
+biplot_dynamic <- ggplot(logfc_comparison, aes(x = Fold_Change_Discovery, y = Fold_Change_Validation, color = Group)) +
+  geom_point(alpha = 0.7, size = 3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray60") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+  # label only the selected Top 30 from the focus category
+  geom_text_repel(
+    data = label_df,
+    inherit.aes = FALSE,
+    aes(x = Fold_Change_Discovery, y = Fold_Change_Validation, label = Label),
+    size = 5, color = "black",
+    max.overlaps = Inf, box.padding = 0.4, min.segment.length = 0
+  ) +
+  scale_color_manual(values = c(
+    "Significant in Both (Same Direction)"       = "hotpink3",
+    "Significant in Both (Opposite Direction)"   = "darkorange",
+    "Significant in discovery (Same Direction)"  = "red",
+    "Discovery Only"                             = "salmon",
+    "Validation Only"                            = "dodgerblue",
+    "Not Significant"                            = "gray70"
+  )) +
+  labs(
+    title = "Biplot of Fold_Change: Discovery vs Validation",
+    subtitle = paste0("Labels: Top 30 within category \"", focus_cat, "\" (ranked by p then |FC|); printing ALL in category + UP/DOWN lists"),
+    x = "Log Fold Change (Discovery)",
+    y = "Log Fold Change (Validation)",
+    color = "Significance Group"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.line  = element_line(),      
+    axis.ticks = element_line())       
+
+print(biplot_dynamic)
+
+ggsave(filename = out_file, plot = biplot_dynamic, width = 10, height = 10, dpi = 600)
+
+
+
+```
+
+#voilin plots known inflammation markers
+Targeted visualisation of 15 pre-selected immune-relevant proteins (CCL5, CD14, CD163, CXCL10, CXCL9, GZMB, IFNG, IL1B, IL6, OSM, TNF, CCL17, CCL22, IL10, TGFB1) using raw NPX values. Note that this chunk reloads the three input files independently rather than reusing the merged dataset from the first chunk; this is intentional to ensure the raw NPX values are used without any prior filtering or imputation applied to the main analysis dataset. Pairwise comparisons use Wilcoxon rank-sum test with global BH correction across all proteins within each cohort.
+```{r}
+# ===== RAW NPX: R5 vs X4 only — Medians + Global BH across proteins; ONE Excel sheet =====
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readxl)
+  library(openxlsx)
+  library(rstatix)    # pairwise_wilcox_test
+  library(ggpubr)     # stat_pvalue_manual
+  library(colorspace)
+})
+
+# --------- CONFIG ---------
+out_dir        <- "R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_VROLINK2/Coreceptor"
+excel_out      <- file.path(out_dir, "RAW_NPX_R5vsX4_Medians_and_Pairwise.xlsx")
+plot_disc_file <- file.path(out_dir, "Plots_NPX_R5vsX4_Discovery.pdf")
+plot_vali_file <- file.path(out_dir, "Plots_NPX_R5vsX4_Validation.pdf")
+plot_both_file <- file.path(out_dir, "Plots_NPX_R5vsX4_BothCohorts.pdf")
+
+# Exact colors
+custom_colors <- c("R5" = "aquamarine3", "X4" = "coral")
+
+# Proteins of interest (deduplicated; keep order)
+protein_symbols <- c(
+  "CCL5", "CD14", "CD163", "CXCL10", "CXCL9", "GZMB", "IFNG", "IL1B", "IL6",  "OSM",  "TNF",  "CCL17",  "CCL22",  "IL10",  "TGFB1"
+)
+# --------- LOAD DATA ---------
+cov_dat_de_master <- openxlsx::read.xlsx(
+  "R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_VROLINK2/updated_OLINK_Explore3072_1910samples_2367proteins_after_bridging_normalization_QCed_21nov2022.xlsx"
+) %>% na.omit()
+
+clinical_df <- openxlsx::read.xlsx(
+  "R:/hcrc/Personal folders/Kavita Mehta/2000HIV/clinical data/KAVITA_IMPUT_DATAFRAME_SMOKING_CURRENT_RESOLVED.xlsx"
+)
+
+# --------- BUILD RAW DF (R5/X4 only; drop Mixed/NA); convert -Inf -> NA ---------
+raw_df <- clinical_df %>%
+  inner_join(cov_dat_de_master, by = "ID") %>%  # Olink NPX
+  mutate(
+    SMOKING_CURRENT = as.numeric(SMOKING_CURRENT),
+    Tropism = factor(Tropism, levels = c("R5", "X4")),
+    COHORT  = factor(COHORT,  levels = c("DISCOVERY", "VALIDATION"))
+  ) %>%
+  filter(!is.na(Tropism), Tropism %in% c("R5", "X4"))
+
+raw_df[raw_df == -Inf] <- NA
+# --------- MAP SYMBOLS -> NPX COLUMNS (handles symbols with multiple panels) ---------
+find_protein_cols <- function(symbols, df) {
+  npx_cols <- colnames(df)
+  out <- vapply(symbols, function(sym){
+    hits <- grep(paste0("^", sym, "_"), npx_cols, value = TRUE)
+    if (length(hits) == 0) return(NA_character_)
+    paste(hits, collapse = ";")
+  }, character(1))
+  tibble(Protein = symbols, NPX_cols = out)
+}
+
+map_tbl <- find_protein_cols(protein_symbols, raw_df)
+if (any(is.na(map_tbl$NPX_cols))) {
+  message("Missing NPX columns for: ",
+          paste(map_tbl$Protein[is.na(map_tbl$NPX_cols)], collapse = ", "))
+}
+map_tbl_expanded <- map_tbl %>%
+  tidyr::separate_rows(NPX_cols, sep = ";") %>%
+  filter(!is.na(NPX_cols) & NPX_cols != "")
+
+# --------- LONG RAW NPX TABLE FOR TARGET PROTEINS ---------
+long_raw <- raw_df %>%
+  dplyr::select(ID, Tropism, COHORT, dplyr::all_of(unique(map_tbl_expanded$NPX_cols))) %>%
+  tidyr::pivot_longer(
+    cols = dplyr::all_of(unique(map_tbl_expanded$NPX_cols)),
+    names_to = "Protein_Panel",
+    values_to = "NPX"
+  ) %>%
+  dplyr::mutate(
+    Protein = sub("_.*$", "", Protein_Panel),
+    Panel   = sub("^[^_]+_", "", Protein_Panel)
+  ) %>%
+  dplyr::filter(Protein %in% protein_symbols, !is.na(NPX))
+
+# Split by cohort
+disc_df <- long_raw %>% filter(COHORT == "DISCOVERY")
+vali_df <- long_raw %>% filter(COHORT == "VALIDATION")
+
+# --------- MEDIANS + PAIRWISE (R5 vs X4 only) ---------
+compute_medians <- function(df_cohort) {
+  df_cohort %>%
+    group_by(Protein, Tropism) %>%
+    summarise(
+      n = dplyr::n(),
+      median_NPX = median(NPX, na.rm = TRUE),
+      IQR_NPX    = IQR(NPX, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+pairwise_R5_X4 <- function(df_cohort) {
+  present <- df_cohort %>%
+    count(Protein, Tropism) %>%
+    filter(n > 0) %>%
+    group_by(Protein) %>%
+    filter(all(c("R5","X4") %in% Tropism)) %>%
+    ungroup() %>%
+    distinct(Protein)
+
+  df_ok <- df_cohort %>% semi_join(present, by = "Protein")
+  if (nrow(df_ok) == 0) {
+    return(tibble(
+      Protein = character(), group1 = character(), group2 = character(),
+      p = numeric(), p_adj = numeric(), p_label = character()
+    ))
+  }
+
+  pw_raw <- df_ok %>%
+    group_by(Protein) %>%
+    rstatix::pairwise_wilcox_test(NPX ~ Tropism, p.adjust.method = "BH") %>%
+    ungroup() %>%
+    filter(group1 %in% "R5" & group2 %in% "X4")
+
+  # Standardize within-protein adjusted p column name -> p_adj
+  std_padj <- function(d) {
+    cand <- c("p_adj","p.adj","padj","Adjusted_P_value","adj_P.Val","adj_P","p_adjust")
+    hit  <- cand[cand %in% names(d)]
+    if (length(hit) == 0) d$p_adj <- NA_real_ else d$p_adj <- d[[hit[1]]]
+    d
+  }
+
+  std_padj(pw_raw) %>%
+    transmute(
+      Protein,
+      group1 = as.character(group1),
+      group2 = as.character(group2),
+      p      = p,
+      p_adj  = p_adj
+    )
+}
+
+disc_medians <- compute_medians(disc_df)
+vali_medians <- compute_medians(vali_df)
+disc_pw      <- pairwise_R5_X4(disc_df)
+vali_pw      <- pairwise_R5_X4(vali_df)
+
+# --------- GLOBAL BH across proteins (per cohort) ---------
+disc_pw <- disc_pw %>%
+  mutate(
+    Global_FDR = p.adjust(p, method = "BH"),
+    p_label    = formatC(Global_FDR, format = "f", digits = 3)
+  )
+
+vali_pw <- vali_pw %>%
+  mutate(
+    Global_FDR = p.adjust(p, method = "BH"),
+    p_label    = formatC(Global_FDR, format = "f", digits = 3)
+  )
+
+# --------- ONE-SHEET SUMMARY (includes Global_FDR) ---------
+make_export_table <- function(cohort_name, med_tbl, pw_tbl) {
+  need_cols <- c("Protein","Tropism","n","median_NPX","IQR_NPX")
+  stopifnot(all(need_cols %in% names(med_tbl)))
+  need_pw <- c("Protein","group1","group2","p","p_adj","Global_FDR","p_label")
+  stopifnot(all(need_pw %in% names(pw_tbl)))
+
+  med_tbl <- tibble::as_tibble(med_tbl)
+  pw_tbl  <- tibble::as_tibble(pw_tbl)
+
+  gsum <- med_tbl %>%
+    transmute(
+      Protein,
+      Group  = Tropism,
+      N      = n,
+      Median = median_NPX,
+      IQR    = IQR_NPX
+    )
+
+  out <- pw_tbl %>%
+    dplyr::left_join(gsum, by = c("Protein" = "Protein", "group1" = "Group")) %>%
+    dplyr::rename(N_Group1 = N, Median_Group1 = Median, IQR_Group1 = IQR) %>%
+    dplyr::left_join(gsum, by = c("Protein" = "Protein", "group2" = "Group")) %>%
+    dplyr::rename(N_Group2 = N, Median_Group2 = Median, IQR_Group2 = IQR) %>%
+    mutate(
+      Dataset          = cohort_name,
+      Column           = Protein,
+      P_value          = p,
+      Adjusted_P_value = p_adj,        # within-protein (trivial here)
+      Global_FDR       = Global_FDR,   # across proteins in this cohort
+      Test             = "Wilcoxon rank-sum; BH across proteins"
+    ) %>%
+    dplyr::select(
+      Dataset, Column, group1, group2,
+      N_Group1, N_Group2, Median_Group1, Median_Group2,
+      IQR_Group1, IQR_Group2, P_value, Adjusted_P_value,
+      Global_FDR, Test
+    ) %>%
+    arrange(Column, group1, group2)
+
+  colnames(out) <- c(
+    "Dataset","Column","Group1","Group2",
+    "N_Group1","N_Group2","Median_Group1","Median_Group2",
+    "IQR_Group1","IQR_Group2","P_value","Adjusted_P_value",
+    "Global_FDR","Test"
+  )
+  out
+}
+
+disc_export <- make_export_table("Discovery",  disc_medians, disc_pw)
+vali_export <- make_export_table("Validation", vali_medians, vali_pw)
+one_sheet   <- bind_rows(disc_export, vali_export)
+
+# Write ONE sheet
+wb <- createWorkbook()
+addWorksheet(wb, "Medians_Pairwise_R5vsX4")
+writeData(wb, "Medians_Pairwise_R5vsX4", one_sheet)
+addStyle(wb, "Medians_Pairwise_R5vsX4", createStyle(textDecoration = "Bold"),
+         rows = 1, cols = 1:ncol(one_sheet), gridExpand = TRUE)
+saveWorkbook(wb, excel_out, overwrite = TRUE)
+
+# --------- BRACKET POSITIONS (per Protein; R5–X4 only) + LABELS USE GLOBAL FDR ---------
+make_pairwise_anno <- function(df_cohort, pw_tbl) {
+  if (nrow(df_cohort) == 0 || nrow(pw_tbl) == 0) return(tibble())
+
+  rng <- df_cohort %>%
+    group_by(Protein) %>%
+    summarise(
+      y_top = as.numeric(quantile(NPX, probs = 0.98, na.rm = TRUE)),
+      y_min = min(NPX, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(step = pmax(0.06 * (y_top - y_min + 1e-6), 0.15))
+
+  pos <- rng %>%
+    transmute(Protein, group1 = "R5", group2 = "X4", y.position = y_top + step*1)
+
+  # add label from pw_tbl (Global_FDR)
+  pos %>%
+    dplyr::left_join(
+  dplyr::select(as.data.frame(pw_tbl), Protein, group1, group2, Global_FDR),
+  by = c("Protein", "group1", "group2")
+) %>%
+    mutate(label = formatC(Global_FDR, format = "f", digits = 3))
+}
+
+disc_pw_anno <- make_pairwise_anno(disc_df, disc_pw)
+vali_pw_anno <- make_pairwise_anno(vali_df, vali_pw)
+
+# --------- PLOTS (labels show Global_FDR) ---------
+make_violin_plot <- function(df_plot, title_txt, anno_df, strip_size = 18) {
+  ggplot(df_plot, aes(x = Tropism, y = NPX, fill = Tropism)) +
+    geom_violin(trim = FALSE, alpha = 0.4) +
+    geom_jitter(aes(color = Tropism), width = 0.2, alpha = 0.9, size = 0.5) +
+    geom_boxplot(width = 0.2, outlier.shape = NA, alpha = 0.5, color = "black") +
+    stat_summary(
+      fun = median, geom = "text",
+      aes(label = round(..y.., 1)),
+      vjust = -0.7, size = 3, color = "black"
+    ) +
+    scale_fill_manual(values = custom_colors, drop = FALSE) +
+    scale_color_manual(values = custom_colors, drop = FALSE) +
+    labs(title = title_txt, x = "", y = "NPX (raw)") +
+    theme_minimal() +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.text.x = element_text(size = 14, color = "black"),
+      axis.text.y = element_text(size = 14, color = "black"),
+      strip.text  = element_text(size = strip_size, face = "bold"),
+      axis.line.x = element_line(color = "black", linewidth = 0.6),
+      axis.line.y = element_line(color = "black", linewidth = 0.6),
+      axis.ticks  = element_line(color = "black")
+    ) +
+    ggpubr::stat_pvalue_manual(
+      data         = anno_df,
+      label        = "label",            # numeric Global_FDR
+      y.position   = "y.position",
+      xmin         = "group1",
+      xmax         = "group2",
+      tip.length   = 0,
+      bracket.size = 0.35,
+      size         = 6,
+      hide.ns      = FALSE,
+      inherit.aes  = FALSE
+    ) +
+    facet_wrap(~ Protein, scales = "free_y", ncol = 5)
+}
+
+plot_discovery <- make_violin_plot(
+  df_plot   = disc_df,
+  title_txt = "RAW NPX by Tropism — Discovery cohort (R5 vs X4)",
+  anno_df   = disc_pw_anno,
+  strip_size = 18
+)
+
+plot_validation <- make_violin_plot(
+  df_plot   = vali_df,
+  title_txt = "RAW NPX by Tropism — Validation cohort (R5 vs X4)",
+  anno_df   = vali_pw_anno,
+  strip_size = 18
+)
+
+# --- Combined plot (no brackets), then enlarge strip text ---
+plot_both <- ggplot(long_raw, aes(x = Tropism, y = NPX, fill = Tropism)) +
+  geom_violin(trim = FALSE, alpha = 0.4) +
+  geom_jitter(aes(color = Tropism), width = 0.2, alpha = 0.9, size = 0.5) +
+  geom_boxplot(width = 0.2, outlier.shape = NA, alpha = 0.5, color = "black") +
+  stat_summary(
+    fun = median, geom = "text",
+    aes(label = round(..y.., 1)),
+    vjust = -0.7, size = 3, color = "black"
+  ) +
+  scale_fill_manual(values = custom_colors, drop = FALSE) +
+  scale_color_manual(values = custom_colors, drop = FALSE) +
+  labs(
+    title = "RAW NPX by Tropism — Discovery vs Validation (R5 vs X4)",
+    x = "", y = "NPX (raw)"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(size = 14, color = "black"),
+    axis.text.y = element_text(size = 14, color = "black"),
+    strip.text  = element_text(face = "bold"),
+    axis.line.x = element_line(color = "black", linewidth = 0.6),
+    axis.line.y = element_line(color = "black", linewidth = 0.6),
+    axis.ticks  = element_line(color = "black")
+  ) +
+  facet_grid(COHORT ~ Protein, scales = "free_y")
+
+plot_both <- plot_both +
+  theme(
+    strip.text.x = element_text(size = 18, face = "bold"),
+    strip.text.y = element_text(size = 18, face = "bold")
+  )
+
+# --------- SAVE ---------
+ggsave(filename = plot_disc_file, plot = plot_discovery, width = 14, height = 9, dpi = 300)
+ggsave(filename = plot_vali_file, plot = plot_validation, width = 14, height = 9, dpi = 300)
+ggsave(filename = plot_both_file, plot = plot_both,     width = 16, height = 10, dpi = 300)
+
+message("Excel (one sheet) -> ", excel_out)
+message("Plots ->\n  ", plot_disc_file, "\n  ", plot_vali_file, "\n  ", plot_both_file)
+
+
+```
+
+#Sensitivity analysis using parametric test
+As a sensitivity analysis, the Wilcoxon tests above are repeated using Welch two-sample t-tests to assess robustness of findings under a parametric assumption. Olink NPX values are approximately normally distributed by design, making the parametric test defensible. The mean difference is computed as X4 minus R5 throughout; the t.test confidence interval direction depends on factor level ordering in R and is retained as returned. Global BH correction is applied across all proteins within each cohort separately.
+```{r}
+# ===== RAW NPX: R5 vs X4 only — PARAMETRIC Welch t-test + Global BH =====
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readxl)
+  library(openxlsx)
+  library(ggpubr)
+  library(colorspace)
+})
+
+# --------- CONFIG ---------
+out_dir <- "R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_VROLINK2/Coreceptor"
+
+if (!dir.exists(out_dir)) {
+  dir.create(out_dir, recursive = TRUE)
+}
+
+excel_out      <- file.path(out_dir, "RAW_NPX_R5vsX4_WelchTtest_GlobalBH.xlsx")
+plot_disc_file <- file.path(out_dir, "Plots_NPX_R5vsX4_Discovery_WelchTtest.pdf")
+plot_vali_file <- file.path(out_dir, "Plots_NPX_R5vsX4_Validation_WelchTtest.pdf")
+plot_both_file <- file.path(out_dir, "Plots_NPX_R5vsX4_BothCohorts_WelchTtest.pdf")
+
+custom_colors <- c(
+  "R5" = "aquamarine3",
+  "X4" = "coral"
+)
+
+protein_symbols <- c(
+  "CCL5", "CD14", "CD163", "CXCL10", "CXCL9",
+  "GZMB", "IFNG", "IL1B", "IL6", "OSM",
+  "TNF", "CCL17", "CCL22", "IL10", "TGFB1"
+)
+
+
+# --------- LOAD DATA ---------
+cov_dat_de_master <- openxlsx::read.xlsx(
+  "R:/hcrc/Personal folders/Kavita Mehta/2000HIV/2000HIV_VROLINK2/updated_OLINK_Explore3072_1910samples_2367proteins_after_bridging_normalization_QCed_21nov2022.xlsx"
+)
+
+clinical_df <- openxlsx::read.xlsx(
+  "R:/hcrc/Personal folders/Kavita Mehta/2000HIV/clinical data/KAVITA_IMPUT_DATAFRAME_SMOKING_CURRENT_RESOLVED.xlsx"
+)
+
+# --------- BUILD RAW DF ---------
+raw_df <- clinical_df %>%
+  dplyr::inner_join(cov_dat_de_master, by = "ID") %>%
+  dplyr::mutate(
+    SMOKING_CURRENT = as.numeric(SMOKING_CURRENT),
+    Tropism = factor(Tropism, levels = c("R5", "X4")),
+    COHORT  = factor(COHORT,  levels = c("DISCOVERY", "VALIDATION"))
+  ) %>%
+  dplyr::filter(
+    !is.na(Tropism),
+    Tropism %in% c("R5", "X4")
+  ) %>%
+  dplyr::mutate(
+    dplyr::across(
+      where(is.numeric),
+      ~ replace(., is.infinite(.), NA)
+    )
+  )
+
+# --------- MAP SYMBOLS TO NPX COLUMNS ---------
+find_protein_cols <- function(symbols, df) {
+
+  npx_cols <- colnames(df)
+
+  out <- vapply(symbols, function(sym) {
+    hits <- grep(paste0("^", sym, "_"), npx_cols, value = TRUE)
+    if (length(hits) == 0) return(NA_character_)
+    paste(hits, collapse = ";")
+  }, character(1))
+
+  tibble::tibble(
+    Protein = symbols,
+    NPX_cols = out
+  )
+}
+
+map_tbl <- find_protein_cols(protein_symbols, raw_df)
+
+if (any(is.na(map_tbl$NPX_cols))) {
+  message(
+    "Missing NPX columns for: ",
+    paste(map_tbl$Protein[is.na(map_tbl$NPX_cols)], collapse = ", ")
+  )
+}
+
+map_tbl_expanded <- map_tbl %>%
+  tidyr::separate_rows(NPX_cols, sep = ";") %>%
+  dplyr::filter(!is.na(NPX_cols), NPX_cols != "")
+
+# --------- LONG RAW NPX TABLE ---------
+long_raw <- raw_df %>%
+  dplyr::select(
+    ID,
+    Tropism,
+    COHORT,
+    dplyr::all_of(unique(map_tbl_expanded$NPX_cols))
+  ) %>%
+  tidyr::pivot_longer(
+    cols = dplyr::all_of(unique(map_tbl_expanded$NPX_cols)),
+    names_to = "Protein_Panel",
+    values_to = "NPX"
+  ) %>%
+  dplyr::mutate(
+    Protein = sub("_.*$", "", Protein_Panel),
+    Panel   = sub("^[^_]+_", "", Protein_Panel),
+    NPX     = suppressWarnings(as.numeric(NPX))
+  ) %>%
+  dplyr::filter(
+    Protein %in% protein_symbols,
+    !is.na(NPX),
+    !is.infinite(NPX)
+  )
+
+disc_df <- long_raw %>%
+  dplyr::filter(COHORT == "DISCOVERY")
+
+vali_df <- long_raw %>%
+  dplyr::filter(COHORT == "VALIDATION")
+
+# --------- SUMMARY STATISTICS ---------
+compute_summary <- function(df_cohort) {
+
+  df_cohort %>%
+    dplyr::group_by(Protein, Tropism) %>%
+    dplyr::summarise(
+      n = dplyr::n(),
+      mean_NPX   = mean(NPX, na.rm = TRUE),
+      sd_NPX     = sd(NPX, na.rm = TRUE),
+      median_NPX = median(NPX, na.rm = TRUE),
+      IQR_NPX    = IQR(NPX, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+# --------- PARAMETRIC TEST: WELCH T-TEST ---------
+pairwise_R5_X4_parametric <- function(df_cohort) {
+
+  present <- df_cohort %>%
+    dplyr::count(Protein, Tropism) %>%
+    dplyr::filter(n > 1) %>%
+    dplyr::group_by(Protein) %>%
+    dplyr::filter(all(c("R5", "X4") %in% Tropism)) %>%
+    dplyr::ungroup() %>%
+    dplyr::distinct(Protein)
+
+  df_ok <- df_cohort %>%
+    dplyr::semi_join(present, by = "Protein")
+
+  if (nrow(df_ok) == 0) {
+    return(tibble::tibble(
+      Protein = character(),
+      group1 = character(),
+      group2 = character(),
+      p = numeric(),
+      estimate_diff_mean = numeric(),
+      conf_low = numeric(),
+      conf_high = numeric()
+    ))
+  }
+
+  df_ok %>%
+    dplyr::group_by(Protein) %>%
+    dplyr::group_modify(~ {
+
+      dat <- .x
+
+      mean_R5 <- mean(dat$NPX[dat$Tropism == "R5"], na.rm = TRUE)
+      mean_X4 <- mean(dat$NPX[dat$Tropism == "X4"], na.rm = TRUE)
+
+      tt <- tryCatch(
+        t.test(NPX ~ Tropism, data = dat, var.equal = FALSE),
+        error = function(e) NULL
+      )
+
+      if (is.null(tt)) {
+        return(tibble::tibble(
+          group1 = "R5",
+          group2 = "X4",
+          p = NA_real_,
+          estimate_diff_mean = mean_X4 - mean_R5,
+          conf_low = NA_real_,
+          conf_high = NA_real_
+        ))
+      }
+
+      # R's t.test CI direction can depend on group order.
+      # Here p-value is reliable; mean difference is manually forced as X4 - R5.
+      tibble::tibble(
+        group1 = "R5",
+        group2 = "X4",
+        p = tt$p.value,
+        estimate_diff_mean = mean_X4 - mean_R5,
+        conf_low = tt$conf.int[1],
+        conf_high = tt$conf.int[2]
+      )
+    }) %>%
+    dplyr::ungroup()
+}
+
+disc_summary <- compute_summary(disc_df)
+vali_summary <- compute_summary(vali_df)
+
+disc_pw <- pairwise_R5_X4_parametric(disc_df)
+vali_pw <- pairwise_R5_X4_parametric(vali_df)
+
+# --------- GLOBAL BH ACROSS PROTEINS WITHIN EACH COHORT ---------
+disc_pw <- disc_pw %>%
+  dplyr::mutate(
+    Global_FDR = p.adjust(p, method = "BH"),
+    p_label = dplyr::case_when(
+      is.na(Global_FDR) ~ "NA",
+      Global_FDR < 0.0001 ~ "<0.0001",
+      TRUE ~ formatC(Global_FDR, format = "g", digits = 2)
+    )
+  )
+
+vali_pw <- vali_pw %>%
+  dplyr::mutate(
+    Global_FDR = p.adjust(p, method = "BH"),
+    p_label = dplyr::case_when(
+      is.na(Global_FDR) ~ "NA",
+      Global_FDR < 0.0001 ~ "<0.0001",
+      TRUE ~ formatC(Global_FDR, format = "g", digits = 2)
+    )
+  )
+
+# --------- EXPORT TABLE ---------
+make_export_table <- function(cohort_name, sum_tbl, pw_tbl) {
+
+  gsum <- sum_tbl %>%
+    dplyr::transmute(
+      Protein,
+      Group = Tropism,
+      N = n,
+      Mean = mean_NPX,
+      SD = sd_NPX,
+      Median = median_NPX,
+      IQR = IQR_NPX
+    )
+
+  out <- pw_tbl %>%
+    dplyr::left_join(
+      gsum,
+      by = c("Protein" = "Protein", "group1" = "Group")
+    ) %>%
+    dplyr::rename(
+      N_Group1 = N,
+      Mean_Group1 = Mean,
+      SD_Group1 = SD,
+      Median_Group1 = Median,
+      IQR_Group1 = IQR
+    ) %>%
+    dplyr::left_join(
+      gsum,
+      by = c("Protein" = "Protein", "group2" = "Group")
+    ) %>%
+    dplyr::rename(
+      N_Group2 = N,
+      Mean_Group2 = Mean,
+      SD_Group2 = SD,
+      Median_Group2 = Median,
+      IQR_Group2 = IQR
+    ) %>%
+    dplyr::mutate(
+      Dataset = cohort_name,
+      Column = Protein,
+      P_value = p,
+      Global_FDR = Global_FDR,
+      P_label = p_label,
+      Test = "Welch two-sample t-test; BH FDR across proteins within cohort"
+    ) %>%
+    dplyr::select(
+      Dataset, Column, group1, group2,
+      N_Group1, N_Group2,
+      Mean_Group1, SD_Group1,
+      Mean_Group2, SD_Group2,
+      Median_Group1, IQR_Group1,
+      Median_Group2, IQR_Group2,
+      estimate_diff_mean, conf_low, conf_high,
+      P_value, Global_FDR, P_label, Test
+    ) %>%
+    dplyr::arrange(Column)
+
+  colnames(out) <- c(
+    "Dataset", "Column", "Group1", "Group2",
+    "N_Group1", "N_Group2",
+    "Mean_Group1", "SD_Group1",
+    "Mean_Group2", "SD_Group2",
+    "Median_Group1", "IQR_Group1",
+    "Median_Group2", "IQR_Group2",
+    "Mean_difference_X4_minus_R5",
+    "CI_low_from_ttest", "CI_high_from_ttest",
+    "P_value", "Global_FDR", "P_label", "Test"
+  )
+
+  out
+}
+
+disc_export <- make_export_table("Discovery", disc_summary, disc_pw)
+vali_export <- make_export_table("Validation", vali_summary, vali_pw)
+
+one_sheet <- dplyr::bind_rows(disc_export, vali_export)
+
+wb <- openxlsx::createWorkbook()
+openxlsx::addWorksheet(wb, "WelchTtest_R5vsX4")
+openxlsx::writeData(wb, "WelchTtest_R5vsX4", one_sheet)
+
+openxlsx::addStyle(
+  wb,
+  "WelchTtest_R5vsX4",
+  openxlsx::createStyle(textDecoration = "Bold"),
+  rows = 1,
+  cols = 1:ncol(one_sheet),
+  gridExpand = TRUE
+)
+
+openxlsx::saveWorkbook(wb, excel_out, overwrite = TRUE)
+
+# --------- BRACKET POSITIONS ---------
+make_pairwise_anno <- function(df_cohort, pw_tbl) {
+
+  if (nrow(df_cohort) == 0 || nrow(pw_tbl) == 0) {
+    return(tibble::tibble())
+  }
+
+  pw_tbl <- as.data.frame(pw_tbl)
+
+  rng <- df_cohort %>%
+    dplyr::group_by(Protein) %>%
+    dplyr::summarise(
+      y_top = as.numeric(quantile(NPX, probs = 0.98, na.rm = TRUE)),
+      y_min = min(NPX, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      step = pmax(0.06 * (y_top - y_min + 1e-6), 0.15)
+    )
+
+  rng %>%
+    dplyr::transmute(
+      Protein,
+      group1 = "R5",
+      group2 = "X4",
+      y.position = y_top + step
+    ) %>%
+    dplyr::left_join(
+      dplyr::select(
+        pw_tbl,
+        Protein, group1, group2, Global_FDR, p_label
+      ),
+      by = c("Protein", "group1", "group2")
+    ) %>%
+    dplyr::mutate(
+      label = p_label
+    )
+}
+
+disc_pw_anno <- make_pairwise_anno(disc_df, disc_pw)
+vali_pw_anno <- make_pairwise_anno(vali_df, vali_pw)
+
+# --------- PLOTS ---------
+make_violin_plot <- function(df_plot, title_txt, anno_df, strip_size = 18) {
+
+  base_plot <- ggplot(df_plot, aes(x = Tropism, y = NPX, fill = Tropism)) +
+    geom_violin(trim = FALSE, alpha = 0.4) +
+    geom_jitter(
+      aes(color = Tropism),
+      width = 0.2,
+      alpha = 0.9,
+      size = 0.5
+    ) +
+    geom_boxplot(
+      width = 0.2,
+      outlier.shape = NA,
+      alpha = 0.5,
+      color = "black"
+    ) +
+    stat_summary(
+      fun = mean,
+      geom = "text",
+      aes(label = round(after_stat(y), 1)),
+      vjust = -0.7,
+      size = 3,
+      color = "black"
+    ) +
+    scale_fill_manual(values = custom_colors, drop = FALSE) +
+    scale_color_manual(values = custom_colors, drop = FALSE) +
+    labs(
+      title = title_txt,
+      x = "",
+      y = "NPX"
+    ) +
+    theme_minimal() +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.text.x = element_text(size = 14, color = "black"),
+      axis.text.y = element_text(size = 14, color = "black"),
+      strip.text = element_text(size = strip_size, face = "bold"),
+      axis.line.x = element_line(color = "black", linewidth = 0.6),
+      axis.line.y = element_line(color = "black", linewidth = 0.6),
+      axis.ticks = element_line(color = "black")
+    ) +
+    facet_wrap(~ Protein, scales = "free_y", ncol = 5)
+
+  if (nrow(anno_df) > 0) {
+    base_plot <- base_plot +
+      ggpubr::stat_pvalue_manual(
+        data = anno_df,
+        label = "label",
+        y.position = "y.position",
+        xmin = "group1",
+        xmax = "group2",
+        tip.length = 0,
+        bracket.size = 0.35,
+        size = 6,
+        hide.ns = FALSE,
+        inherit.aes = FALSE
+      )
+  }
+
+  base_plot
+}
+
+plot_discovery <- make_violin_plot(
+  df_plot = disc_df,
+  title_txt = "NPX by Tropism — Discovery cohort, Welch t-test R5 vs X4",
+  anno_df = disc_pw_anno,
+  strip_size = 18
+)
+
+plot_validation <- make_violin_plot(
+  df_plot = vali_df,
+  title_txt = "NPX by Tropism — Validation cohort, Welch t-test R5 vs X4",
+  anno_df = vali_pw_anno,
+  strip_size = 18
+)
+
+plot_both <- ggplot(long_raw, aes(x = Tropism, y = NPX, fill = Tropism)) +
+  geom_violin(trim = FALSE, alpha = 0.4) +
+  geom_jitter(
+    aes(color = Tropism),
+    width = 0.2,
+    alpha = 0.9,
+    size = 0.5
+  ) +
+  geom_boxplot(
+    width = 0.2,
+    outlier.shape = NA,
+    alpha = 0.5,
+    color = "black"
+  ) +
+  stat_summary(
+    fun = mean,
+    geom = "text",
+    aes(label = round(after_stat(y), 1)),
+    vjust = -0.7,
+    size = 3,
+    color = "black"
+  ) +
+  scale_fill_manual(values = custom_colors, drop = FALSE) +
+  scale_color_manual(values = custom_colors, drop = FALSE) +
+  labs(
+    title = "NPX by Tropism — Discovery vs Validation",
+    x = "",
+    y = "NPX"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(size = 14, color = "black"),
+    axis.text.y = element_text(size = 14, color = "black"),
+    strip.text = element_text(face = "bold"),
+    axis.line.x = element_line(color = "black", linewidth = 0.6),
+    axis.line.y = element_line(color = "black", linewidth = 0.6),
+    axis.ticks = element_line(color = "black")
+  ) +
+  facet_grid(COHORT ~ Protein, scales = "free_y") +
+  theme(
+    strip.text.x = element_text(size = 18, face = "bold"),
+    strip.text.y = element_text(size = 18, face = "bold")
+  )
+
+# --------- SAVE ---------
+ggsave(
+  filename = plot_disc_file,
+  plot = plot_discovery,
+  width = 14,
+  height = 9,
+  dpi = 300
+)
+
+ggsave(
+  filename = plot_vali_file,
+  plot = plot_validation,
+  width = 14,
+  height = 9,
+  dpi = 300
+)
+
+ggsave(
+  filename = plot_both_file,
+  plot = plot_both,
+  width = 16,
+  height = 10,
+  dpi = 300
+)
+
+message("Excel -> ", excel_out)
+message("Plots ->\n  ", plot_disc_file, "\n  ", plot_vali_file, "\n  ", plot_both_file)
+```
+
+
+
